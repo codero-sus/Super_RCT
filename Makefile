@@ -2,6 +2,7 @@
 #                          make test       (run integration tests)
 #                          make size       (show binary size)
 #                          make gen        (regenerate command tables)
+#                          make check-gen  (fail if command tables are stale)
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -g
 CFLAGS  += -Wall -Wextra -Wpedantic -Wshadow -Wformat=2
@@ -14,7 +15,7 @@ SRC     := src/super_rct.c
 RELFLAGS := -Os -s -ffunction-sections -fdata-sections
 RELLDFLAGS := -Wl,--gc-sections
 
-.PHONY: all release test size gen clean
+.PHONY: all release test size gen check-gen clean
 
 all: $(TARGET)
 
@@ -33,6 +34,9 @@ test: all
 
 gen:
 	python3 tools/gen_commands.py
+
+check-gen:
+	python3 tools/gen_commands.py --check
 
 size: release
 	@ls -l $(TARGET) | awk '{printf "%s: %d bytes\n", $$9, $$5}'

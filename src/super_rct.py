@@ -11,6 +11,8 @@ Configuration (environment variables)
   SUPER_RCT_SESSION_SECONDS  Idle timeout for a login (default 3600)
   SUPER_RCT_IP_FILE          IP registry file (default super_rct_ips.txt)
   SUPER_RCT_API              API base URL (default https://api.telegram.org)
+  SUPER_RCT_WATCH_PATHS      comma-separated paths to watch (optional)
+  SUPER_RCT_WATCH_MAX_AGE_HOURS  watched file is stale after N hours (default 24)
 """
 
 import hmac
@@ -27,8 +29,9 @@ import urllib.parse
 import urllib.request
 
 from commands_table import COMMANDS
+from monitor import CMD_TIMEOUT_S, MonitorMixin
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_API = "https://api.telegram.org"
 DEFAULT_IP_FILE = "super_rct_ips.txt"
 DEFAULT_SESSION_S = 3600
@@ -44,7 +47,10 @@ SEND_TIMEOUT_S = 20
 RETRY_DELAY_S = 5
 MAX_FAILS = 3
 LOCKOUT_S = 300
-CMD_TIMEOUT_S = 5
+MAX_URL = 512
+MAX_WATCH = 16
+DEFAULT_WATCH_MAX_H = 24
+MAX_WATCH_MAX_H = 8760
 READ_MAX = 65536
 OUT_MAX = 3500  # body cap, well under Telegram's 4096 characters
 CHUNK_MAX = 3500
@@ -73,6 +79,9 @@ def usage_text():
         "  SUPER_RCT_PASSWORD         login password, 8-128 bytes (required)\n"
         f"  SUPER_RCT_SESSION_SECONDS  idle timeout for a login (default {DEFAULT_SESSION_S})\n"
         f"  SUPER_RCT_IP_FILE          IP registry file (default {DEFAULT_IP_FILE})\n"
+        "  SUPER_RCT_WATCH_PATHS      comma-separated paths to watch (optional)\n"
+        f"  SUPER_RCT_WATCH_MAX_AGE_HOURS  watched file is stale after N hours "
+        f"(default {DEFAULT_WATCH_MAX_H})\n"
         f"  SUPER_RCT_API              API base URL (default {DEFAULT_API})\n"
     )
 
@@ -139,6 +148,23 @@ def load_config(env):
 
     ip_file = env.get("SUPER_RCT_IP_FILE", "") or DEFAULT_IP_FILE
 
+    watch_paths = []
+    for part in env.get("SUPER_RCT_WATCH_PATHS", "").split(","):
+        part = part.strip(" ")
+        if not part:
+            continue
+        if not part.startswith("/") or len(part.encode()) >= MAX_URL or len(watch_paths) >= MAX_WATCH:
+            raise ConfigError(f"SUPER_RCT_WATCH_PATHS needs absolute paths (max {MAX_WATCH})")
+        watch_paths.append(part)
+
+    watch_max_h = DEFAULT_WATCH_MAX_H
+    raw_watch = env.get("SUPER_RCT_WATCH_MAX_AGE_HOURS", "")
+    if raw_watch:
+        value = parse_int(raw_watch)
+        if value is None or not 1 <= value <= MAX_WATCH_MAX_H:
+            raise ConfigError(f"SUPER_RCT_WATCH_MAX_AGE_HOURS must be 1-{MAX_WATCH_MAX_H}")
+        watch_max_h = value
+
     return {
         "token": token,
         "password": password,
@@ -146,6 +172,8 @@ def load_config(env):
         "chats": chats,
         "api": api.rstrip("/"),
         "ip_file": ip_file,
+        "watch_paths": watch_paths,
+        "watch_max_h": watch_max_h,
     }
 
 
@@ -167,13 +195,18 @@ class Telegram:
 
 
 class ChatState:
-    __slots__ = ("chat", "session_until", "fails", "locked_until")
+    __slots__ = ("chat", "session_until", "fails", "locked_until",
+                 "thr", "fired", "report_every", "report_next")
 
     def __init__(self, chat):
         self.chat = chat
         self.session_until = 0  # logged in while now < session_until
         self.fails = 0          # consecutive wrong passwords
         self.locked_until = 0   # refuses /auth while now < locked_until
+        self.thr = [-1.0] * 4   # alert limits: mem, disk, temp, load (-1 = off)
+        self.fired = [False] * 4
+        self.report_every = 0   # scheduled health report interval, 0 = off
+        self.report_next = 0
 
 
 class IpRegistry:
@@ -243,7 +276,7 @@ def chunk_lines(text, limit=CHUNK_MAX):
     return chunks
 
 
-class Bot:
+class Bot(MonitorMixin):
     def __init__(self, cfg):
         self.tg = Telegram(cfg["api"], cfg["token"])
         self.password = cfg["password"].encode()
@@ -252,6 +285,7 @@ class Bot:
         self.registry = IpRegistry(cfg["ip_file"])
         self.offset = 0
         self.started = time.time()
+        self.init_monitor(cfg, VERSION)
 
     # -- transport -----------------------------------------------------------
 
@@ -264,6 +298,10 @@ class Bot:
             return
         if not resp.get("ok"):
             log(f"sendMessage to chat {chat} failed: {resp.get('description', '')}")
+
+    def reply_long(self, chat, text):
+        for chunk in chunk_lines(text):
+            self.reply(chat, chunk)
 
     # -- commands ------------------------------------------------------------
 
@@ -283,6 +321,7 @@ class Bot:
             return
 
         st.fails += 1
+        self.auth_failures += 1
         log(f"failed login for chat {st.chat} ({st.fails}/{MAX_FAILS})")
         if st.fails >= MAX_FAILS:
             st.fails = 0
@@ -387,6 +426,7 @@ class Bot:
         if st is None:
             log(f"ignored message from unauthorised chat {chat}")
             return
+        self.cmds_handled += 1
 
         # Same split as the C variant: first word is the command, the rest
         # (internal spaces kept) is the argument, so passwords may contain spaces.
@@ -414,6 +454,8 @@ class Bot:
             self.reply(chat, "Not authenticated. Send /auth <password> first.")
         else:
             st.session_until = now + self.session_s  # sliding idle timeout
+            if self.monitor_dispatch(chat, st, cmd, arg, now):
+                return
             if cmd == "/status":
                 self.cmd_status(chat)
             elif cmd == "/ip":
@@ -465,6 +507,7 @@ class Bot:
         try:
             while True:
                 self.poll_once()
+                self.monitor_tick(int(time.time()))
         except Stop:
             pass
         log("Super_RCT stopped")

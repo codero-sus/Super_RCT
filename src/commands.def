@@ -276,3 +276,32 @@ node_version|c|node --version|Node.js version
 git_version|c|git --version|Git version
 docker_containers|c|docker ps|Running Docker containers
 docker_images|c|docker images|Docker images
+# Monitoring and utilities (built-in, /auth required)
+health|b||Health summary: CPU, memory, disk, load, temp
+mem|b||Memory usage
+swap|b||Swap usage
+disk|b||Disk usage with percentages
+load|b||Load average per core
+temp|b||Hottest thermal zone
+cpu|b||CPU busy percentage (1 second sample)
+net_rate|b||Network throughput (1 second sample)
+procs|b||Process count and top CPU consumers
+uptime_h|b||Uptime in human-readable form
+failed_units|b||Failed systemd units
+updates_count|b||Pending package updates
+reboot_required|b||Whether a reboot is pending
+alert|b||Threshold alerts: list, set, off, check
+report|b||Scheduled health reports: status, on, off, now
+remind|b||Reminder: /remind <minutes> <text>
+timers|b||List pending reminders
+timer_cancel|b||Cancel a reminder by id
+watch|b||Show watched file ages
+watch_check|b||Report stale watched files now
+notify|b||Desktop notification on the host
+echo|b||Echo your text back
+botstats|b||Bot counters: uptime, commands, auth failures
+sessions|b||Logged-in chats and session expiry
+logout_all|b||End every session
+about|b||Version and build info
+selftest|b||Quick self-check of the bot's dependencies
+config|b||Effective settings (secrets redacted)

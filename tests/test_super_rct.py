@@ -30,7 +30,7 @@ TOKEN = "123456789:TEST_token_for_mock_only"
 PASSWORD = "correct horse battery"
 ALLOWED_CHAT = 42
 STRANGER_CHAT = 999
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 AUTH = f"/auth {PASSWORD}"
 
 
@@ -353,6 +353,105 @@ class BotCases:
         # Backs off between errors instead of hammering the API.
         self.assertLessEqual(len(mock.offsets), 2, mock.offsets)
 
+    # -- monitoring and utilities (all behind /auth) -------------------------
+
+    def test_monitoring_requires_auth(self):
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, "/health")]], expect_replies=1)
+        self.assertEqual(replies, ["Not authenticated. Send /auth <password> first."])
+
+    def test_monitoring_commands(self):
+        cmds = [
+            (AUTH, None),
+            ("/auth wrong-password", None),
+            ("/botstats", "Failed logins: 1"),
+            ("/health", f"Health (Super_RCT {VERSION})"),
+            ("/mem", "Memory"),
+            ("/load", "Load:"),
+            ("/uptime_h", "Up "),
+            ("/procs", "Running processes:"),
+            ("/reboot_required", "Reboot required: "),
+            ("/cpu", "CPU "),
+            ("/about", f"Super_RCT {VERSION} (variant: "),
+            ("/echo hello  world", "hello  world"),
+            ("/echo", "Usage: /echo <text>"),
+            ("/remind 0 nope", "Usage: /remind <minutes 1-10080> <text>"),
+            ("/remind 5 check the disk", r"re:Reminder #1 set for \d\d:\d\d\."),
+            ("/timers", r"re:#1 at \d\d:\d\d: check the disk"),
+            ("/timer_cancel 1", "Reminder #1 cancelled."),
+            ("/timer_cancel 99", "No pending reminder with id 99."),
+            ("/report status", "Scheduled reports are off. Use /report on <minutes>."),
+            ("/report on 2", "Usage: /report on <minutes>  (5-1440)"),
+            ("/report on 5", "Health reports on: every 5 minutes."),
+            ("/report off", "Scheduled reports turned off."),
+            ("/alert list", "Alert limits (reply lists current settings):\n"
+                            "mem: off\ndisk: off\ntemp: off\nload: off\n"),
+            ("/alert set mem 200", "Value for mem is out of range."),
+            ("/alert set mem 99", "Alert for mem set; you will be notified when it is reached."),
+            ("/alert off mem", "Alert for mem turned off."),
+            ("/alert nope", "Usage: /alert list | set <metric> <value> | off <metric> | check"),
+            ("/watch", "No watch paths configured (set SUPER_RCT_WATCH_PATHS)."),
+            ("/sessions", "chat 42: logged in"),
+            ("/config", "Allowed chats: 2"),
+            ("/selftest", "Config: OK"),
+            ("/logout_all", "All login sessions ended. Send /auth <password> to log in again."),
+            ("/mem", "Not authenticated. Send /auth <password> first."),
+        ]
+        batch = [make_update(i + 1, ALLOWED_CHAT, text) for i, (text, _) in enumerate(cmds)]
+        replies = self.run_bot([batch], expect_replies=len(cmds), timeout=40, settle=0.5)
+
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertEqual(len(replies), len(cmds), replies)
+        for reply, (text, expected) in zip(replies, cmds):
+            if expected is None:
+                continue
+            with self.subTest(command=text):
+                if expected.startswith("re:"):
+                    self.assertRegex(reply, expected[3:])
+                elif expected in ("Memory", "Load:", "Up ", "Running processes:",
+                                  "Reboot required: ", "CPU ", "Config: OK"):
+                    self.assertTrue(reply.startswith(expected) or expected in reply, reply[:80])
+                elif expected.startswith("Health ("):
+                    self.assertTrue(reply.startswith(expected), reply[:80])
+                elif expected.startswith(("Super_RCT ", "chat ", "Allowed chats", "Failed logins")):
+                    self.assertIn(expected, reply)
+                else:
+                    self.assertEqual(reply, expected)
+        # Secrets never leave the host in /config.
+        self.assertNotIn(TOKEN, replies[cmds.index(("/config", "Allowed chats: 2"))])
+        self.assertNotIn(PASSWORD, replies[cmds.index(("/config", "Allowed chats: 2"))])
+
+    def test_watch_paths(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "backup.log")
+        with open(path, "w") as f:
+            f.write("ok\n")
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/watch"),
+            make_update(3, ALLOWED_CHAT, "/watch_check"),
+        ]], expect_replies=3, SUPER_RCT_WATCH_PATHS=f"{path},/nonexistent_super_rct/x")
+        self.assertIn(f"{path}  age ", replies[1])
+        self.assertIn("/nonexistent_super_rct/x  (missing)", replies[1])
+        self.assertIn("/nonexistent_super_rct/x  (missing)", replies[2])
+        self.assertNotIn("are fresh", replies[2])
+
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/watch_check"),
+        ]], expect_replies=2, SUPER_RCT_WATCH_PATHS=path)
+        self.assertEqual(replies[1], "All 1 watched paths are fresh (limit 24 h).")
+
+    def test_alert_check_shows_values(self):
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/alert set disk 98"),
+            make_update(3, ALLOWED_CHAT, "/alert check"),
+        ]], expect_replies=3)
+        self.assertEqual(replies[1], "Alert for disk set; you will be notified when it is reached.")
+        self.assertTrue(replies[2].startswith("Current values:\n"), replies[2])
+        self.assertIn("disk: ", replies[2])
+        self.assertIn("(limit 98.0%)", replies[2])
+
     def test_config_errors(self):
         cases = [
             ({"SUPER_RCT_TOKEN": "short"}, "SUPER_RCT_TOKEN"),
@@ -365,6 +464,8 @@ class BotCases:
             ({"SUPER_RCT_SESSION_SECONDS": "2"}, "SUPER_RCT_SESSION_SECONDS"),
             ({"SUPER_RCT_SESSION_SECONDS": "soon"}, "SUPER_RCT_SESSION_SECONDS"),
             ({"SUPER_RCT_API": "ftp://x"}, "SUPER_RCT_API"),
+            ({"SUPER_RCT_WATCH_PATHS": "relative/x"}, "SUPER_RCT_WATCH_PATHS"),
+            ({"SUPER_RCT_WATCH_MAX_AGE_HOURS": "0"}, "SUPER_RCT_WATCH_MAX_AGE_HOURS"),
         ]
         for overrides, needle in cases:
             with self.subTest(overrides=overrides):
