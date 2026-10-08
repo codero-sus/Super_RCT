@@ -49,7 +49,7 @@
 
 #include "commands_table.h"
 
-#define SRCT_VERSION "0.4.0"
+#define SRCT_VERSION "0.5.0"
 
 #define DEFAULT_API "https://api.telegram.org"
 #define DEFAULT_IP_FILE "super_rct_ips.txt"
@@ -87,6 +87,9 @@ typedef struct {
     bool fired[4];        /* alert currently raised */
     time_t report_every;  /* scheduled health report interval, 0 = off */
     time_t report_next;
+    bool discord;         /* true for a Discord channel, false for Telegram */
+    uint64_t dc_cursor;   /* newest Discord message ID handled */
+    bool dc_primed;       /* cursor set from the channel's current newest message */
 } chat_state;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -288,7 +291,7 @@ static void api_url(char *dst, size_t n, const char *method) {
     snprintf(dst, n, "%s/bot%s/%s", g_api, g_token, method);
 }
 
-static int tg_get_updates(buf_t *out) {
+static int tg_get_updates(int timeout_s, buf_t *out) {
     buf_t cfg = {0};
     char url[MAX_URL + MAX_TOKEN + 64];
     char kv[64];
@@ -297,7 +300,7 @@ static int tg_get_updates(buf_t *out) {
     api_url(url, sizeof url, "getUpdates");
     cfg_put(&cfg, "url", url);
     /* One data-urlencode directive per field, so each is sent as its own parameter. */
-    snprintf(kv, sizeof kv, "timeout=%d", POLL_TIMEOUT_S);
+    snprintf(kv, sizeof kv, "timeout=%d", timeout_s);
     cfg_put(&cfg, "data-urlencode", kv);
     snprintf(kv, sizeof kv, "offset=%" PRId64, g_offset);
     cfg_put(&cfg, "data-urlencode", kv);
@@ -473,6 +476,8 @@ static ip_entry *ip_find(const char *ip) {
     return NULL;
 }
 
+#include "discord_transport.h"
+
 static void ip_load(void) {
     FILE *f = fopen(g_ipfile, "r");
     char line[256];
@@ -556,6 +561,16 @@ static int chat_index(int64_t chat) {
     return -1;
 }
 
+/* Sends text to whichever service the chat belongs to. */
+static void send_text(int64_t chat, const char *text) {
+    int i = chat_index(chat);
+
+    if (i >= 0 && g_chats[i].discord)
+        discord_send(chat, text);
+    else
+        tg_send_text(chat, text);
+}
+
 static void reply(int64_t chat, const char *fmt, ...) {
     char text[MAX_TEXT];
     va_list ap;
@@ -563,7 +578,7 @@ static void reply(int64_t chat, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(text, sizeof text, fmt, ap);
     va_end(ap);
-    tg_send_text(chat, text);
+    send_text(chat, text);
 }
 
 static void cmd_help(int64_t chat) {
@@ -878,14 +893,14 @@ static void send_long(int64_t chat, const char *text) {
         size_t len = nl ? (size_t)(nl - p) + 1 : strlen(p);
 
         if (chunk.len && chunk.len + len > CHUNK_MAX) {
-            tg_send_text(chat, chunk.data);
+            send_text(chat, chunk.data);
             buf_free(&chunk);
         }
         buf_add(&chunk, p, len);
         p += len;
     }
     if (chunk.len)
-        tg_send_text(chat, chunk.data);
+        send_text(chat, chunk.data);
     buf_free(&chunk);
 }
 
@@ -945,7 +960,7 @@ static void run_table_command(int64_t chat, const rct_cmd_def *def) {
         if (cut < body.len)
             buf_add(&msg, "\n... (truncated)", 16);
     }
-    tg_send_text(chat, msg.data);
+    send_text(chat, msg.data);
     buf_free(&body);
     buf_free(&msg);
 }
@@ -1192,6 +1207,68 @@ static bool load_config(void) {
         }
     }
 
+    {
+        const char *dt = getenv("SUPER_RCT_DISCORD_TOKEN");
+        const char *dc = getenv("SUPER_RCT_DISCORD_CHANNEL_IDS");
+        const char *da = getenv("SUPER_RCT_DISCORD_API");
+
+        if (da && *da) {
+            if (strlen(da) >= MAX_URL) {
+                fprintf(stderr, "error: SUPER_RCT_DISCORD_API is too long\n");
+                return false;
+            }
+            if (strncmp(da, "https://", 8) != 0 && strncmp(da, "http://", 7) != 0) {
+                fprintf(stderr, "error: SUPER_RCT_DISCORD_API must start with https:// or http://\n");
+                return false;
+            }
+            snprintf(g_discord_api, sizeof g_discord_api, "%s", da);
+        }
+        if (dt && *dt) {
+            const char *p = dc ? dc : "";
+            char *end;
+
+            if (!discord_token_valid(dt)) {
+                fprintf(stderr, "error: SUPER_RCT_DISCORD_TOKEN is malformed\n");
+                return false;
+            }
+            if (!*p) {
+                fprintf(stderr, "error: SUPER_RCT_DISCORD_CHANNEL_IDS is required with a Discord token\n");
+                return false;
+            }
+            snprintf(g_discord_token, sizeof g_discord_token, "%s", dt);
+            g_discord_on = true;
+            for (;;) {
+                long long v;
+
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                v = strtoll(p, &end, 10);
+                if (end == p || v <= 0 || g_nchats >= MAX_CHATS) {
+                    fprintf(stderr, "error: bad channel id list in SUPER_RCT_DISCORD_CHANNEL_IDS\n");
+                    return false;
+                }
+                for (int i = 0; i < g_nchats; i++)
+                    if (g_chats[i].chat == (int64_t)v) {
+                        fprintf(stderr, "error: an ID appears in both chat and channel lists\n");
+                        return false;
+                    }
+                g_chats[g_nchats].chat = (int64_t)v;
+                g_chats[g_nchats].discord = true;
+                g_nchats++;
+                p = end;
+                while (*p == ' ' || *p == '\t')
+                    p++;
+                if (*p == '\0')
+                    break;
+                if (*p != ',') {
+                    fprintf(stderr, "error: bad channel id list in SUPER_RCT_DISCORD_CHANNEL_IDS\n");
+                    return false;
+                }
+                p++;
+            }
+        }
+    }
+
     for (int i = 0; i < g_nchats; i++)
         for (int k = 0; k < 4; k++)
             g_chats[i].thr[k] = -1.0;
@@ -1312,7 +1389,7 @@ int main(int argc, char **argv) {
     while (!g_stop) {
         buf_t resp = {0};
 
-        if (tg_get_updates(&resp) != 0 || !resp.data) {
+        if (tg_get_updates(g_discord_on ? 1 : POLL_TIMEOUT_S, &resp) != 0 || !resp.data) {
             if (g_stop) {
                 buf_free(&resp);
                 break;
@@ -1325,6 +1402,12 @@ int main(int argc, char **argv) {
         if (!handle_response(resp.data))
             sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
         buf_free(&resp);
+        if (g_discord_on && time(NULL) >= g_next_discord_poll) {
+            g_next_discord_poll = time(NULL) + DISCORD_POLL_S;
+            for (int i = 0; i < g_nchats; i++)
+                if (g_chats[i].discord)
+                    discord_poll(&g_chats[i], handle_message);
+        }
         monitor_tick(time(NULL));
     }
 

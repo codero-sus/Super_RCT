@@ -115,8 +115,45 @@ python3 src/super_rct.py
 ### Tests
 
 ```sh
-make test       # runs the same 12 tests against the C binary and the Python script
+make test       # bot tests against the C binary and the Python script, then installer tests
 ```
+
+## Discord
+
+Discord is optional and runs next to Telegram. It uses the same `/auth`
+password and the same commands.
+
+- Create an application in the Discord Developer Portal, add a bot, and copy
+  its token into `SUPER_RCT_DISCORD_TOKEN`.
+- Under Bot, enable the **Message Content** privileged intent. Without it the
+  bot cannot read command text.
+- Invite the bot with *Read Message History* and *Send Messages* on the target
+  channel. Put that channel ID in `SUPER_RCT_DISCORD_CHANNEL_IDS`.
+- Use a private channel. Anyone who can see the channel can see the password
+  if it is typed there, and the bot's replies.
+- Channel IDs must not overlap with `SUPER_RCT_CHAT_IDS`.
+
+## Install on your own Linux machine
+
+`build/installers/super_rct-linux` (C) and `build/installers/super_rct-linux.py`
+(Python) are built by `python3 tools/build_installers.py`. Each one bundles the
+bot. Run it on the machine you own:
+
+```sh
+./super_rct-linux install      # asks for the tokens, chat IDs and password
+./super_rct-linux uninstall    # stops the service and removes what install added
+```
+
+- Install writes the bot files, `super_rct.env` (mode 0600, your secrets) and a
+  manifest `super_rct_install.txt` into the current directory. It refuses to
+  overwrite existing files.
+- It registers a visible systemd user service, `super-rct.service`, under
+  `~/.config/systemd/user/`. Where systemd user services are not available, it
+  writes the files and tells you to start the bot yourself.
+- Uninstall removes only the files listed in the manifest, then the manifest.
+  The installer file stays where it is, so you can see it and delete it.
+- The installer does not hide itself and does not copy itself anywhere else.
+- Windows and macOS installers are not in this repository yet.
 
 ## Setup
 

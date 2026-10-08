@@ -31,6 +31,7 @@ $(BUILD):
 
 test: all
 	python3 tests/test_super_rct.py
+	python3 tests/test_installers.py
 
 gen:
 	python3 tools/gen_commands.py

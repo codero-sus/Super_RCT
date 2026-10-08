@@ -30,7 +30,7 @@ TOKEN = "123456789:TEST_token_for_mock_only"
 PASSWORD = "correct horse battery"
 ALLOWED_CHAT = 42
 STRANGER_CHAT = 999
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 AUTH = f"/auth {PASSWORD}"
 
 
@@ -117,6 +117,86 @@ class MockTelegram:
     def replies_to(self, chat):
         with self.lock:
             return [t for c, t in self.sent if c == chat]
+
+
+DISCORD_TOKEN = "DISCORD_TEST_TOKEN_abcdefghijklmnopqrstuvwxyz0123"
+DISCORD_CHANNEL = 900001
+
+
+class MockDiscord:
+    """Serves channel messages like the Discord REST API; records posted messages."""
+
+    def __init__(self, channels):
+        self.messages = {c: list(m) for c, m in channels.items()}
+        self.sent = []  # (channel, content)
+        self.lock = threading.Lock()
+        mock = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, code, payload):
+                data = json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _authorised(self):
+                if (self.headers.get("Authorization") == f"Bot {DISCORD_TOKEN}"
+                        and self.headers.get("User-Agent")):
+                    return True
+                self._send(401, {"message": "401: Unauthorized", "code": 0})
+                return False
+
+            def do_GET(self):
+                if not self._authorised():
+                    return
+                url = urllib.parse.urlparse(self.path)
+                channel = int(url.path.split("/")[-2])
+                query = dict(urllib.parse.parse_qsl(url.query))
+                limit = int(query.get("limit", 50))
+                with mock.lock:
+                    msgs = list(mock.messages.get(channel, []))
+                if "after" in query:
+                    msgs = sorted((m for m in msgs if int(m["id"]) > int(query["after"])),
+                                  key=lambda m: int(m["id"]))[:limit]
+                    self._send(200, list(reversed(msgs)))  # Discord: newest first
+                else:
+                    msgs = sorted(msgs, key=lambda m: int(m["id"]), reverse=True)[:limit]
+                    self._send(200, msgs)
+
+            def do_POST(self):
+                if not self._authorised():
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode() or "{}")
+                channel = int(self.path.split("/")[-2])
+                with mock.lock:
+                    mock.sent.append((channel, body.get("content", "")))
+                self._send(200, {"id": "999", "content": body.get("content", "")})
+
+        self.server = QuietServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def add(self, channel, message):
+        with self.lock:
+            self.messages.setdefault(channel, []).append(message)
+
+    def sent_texts(self):
+        with self.lock:
+            return [t for _c, t in self.sent]
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def make_update(update_id, chat_id, text):
@@ -352,6 +432,60 @@ class BotCases:
         self.assertIn("Unauthorized", err)
         # Backs off between errors instead of hammering the API.
         self.assertLessEqual(len(mock.offsets), 2, mock.offsets)
+
+    # -- Discord transport ---------------------------------------------------
+
+    def test_discord_commands(self):
+        tmp = tempfile.mkdtemp()
+        history = [{"id": "100", "content": "/auth stale-history",
+                    "author": {"bot": False}}]
+        dc = MockDiscord({DISCORD_CHANNEL: history})
+        with MockTelegram([]) as tg, dc:
+            env = base_env(SUPER_RCT_API=tg.url,
+                           SUPER_RCT_IP_FILE=os.path.join(tmp, "ips.txt"),
+                           SUPER_RCT_DISCORD_TOKEN=DISCORD_TOKEN,
+                           SUPER_RCT_DISCORD_CHANNEL_IDS=str(DISCORD_CHANNEL),
+                           SUPER_RCT_DISCORD_API=dc.url + "/api/v10")
+            proc = subprocess.Popen(self.command, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            time.sleep(1.5)  # the first poll only records the newest message
+            dc.add(DISCORD_CHANNEL, {"id": "101", "content": AUTH, "author": {"bot": False}})
+            dc.add(DISCORD_CHANNEL, {"id": "102", "content": "/echo hi",
+                                     "author": {"bot": False}})
+            dc.add(DISCORD_CHANNEL, {"id": "103", "content": "/echo from-bot",
+                                     "author": {"bot": True}})
+            deadline = time.time() + 25
+            while time.time() < deadline and len(dc.sent_texts()) < 2:
+                time.sleep(0.1)
+            time.sleep(0.5)
+            proc.send_signal(signal.SIGTERM)
+            try:
+                _, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, err = proc.communicate()
+        texts = dc.sent_texts()
+        self.assertEqual(len(texts), 2, (texts, err))
+        self.assertTrue(texts[0].startswith("Authenticated."), texts[0])
+        self.assertEqual(texts[1], "hi")
+        self.assertEqual(tg.sent, [])  # Discord replies never go to Telegram
+
+    def test_discord_config_errors(self):
+        cases = [
+            ({"SUPER_RCT_DISCORD_TOKEN": "short"}, "SUPER_RCT_DISCORD_TOKEN"),
+            ({"SUPER_RCT_DISCORD_TOKEN": DISCORD_TOKEN}, "SUPER_RCT_DISCORD_CHANNEL_IDS"),
+            ({"SUPER_RCT_DISCORD_TOKEN": DISCORD_TOKEN,
+              "SUPER_RCT_DISCORD_CHANNEL_IDS": "42"}, "appears in both"),
+            ({"SUPER_RCT_DISCORD_TOKEN": DISCORD_TOKEN,
+              "SUPER_RCT_DISCORD_CHANNEL_IDS": "900001",
+              "SUPER_RCT_DISCORD_API": "ftp://example.com"}, "SUPER_RCT_DISCORD_API"),
+        ]
+        for overrides, needle in cases:
+            with self.subTest(overrides=overrides):
+                res = subprocess.run(self.command, env=base_env(**overrides),
+                                     capture_output=True, text=True, timeout=10)
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn(needle, res.stderr)
 
     # -- monitoring and utilities (all behind /auth) -------------------------
 
