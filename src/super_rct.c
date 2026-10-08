@@ -31,6 +31,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <signal.h>
@@ -45,6 +46,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "commands_table.h"
 
 #define SRCT_VERSION "0.3.0"
 
@@ -297,23 +300,26 @@ static int tg_get_updates(buf_t *out) {
 
 static int tg_send_text(int64_t chat, const char *text) {
     buf_t cfg = {0};
+    buf_t kv = {0};
     buf_t out = {0};
     char url[MAX_URL + MAX_TOKEN + 64];
-    char kv[MAX_TEXT + 64];
+    char num[32];
     int rc;
 
     api_url(url, sizeof url, "sendMessage");
     cfg_put(&cfg, "url", url);
-    snprintf(kv, sizeof kv, "chat_id=%" PRId64, chat);
-    cfg_put(&cfg, "data-urlencode", kv);
-    snprintf(kv, sizeof kv, "text=%s", text);
-    cfg_put(&cfg, "data-urlencode", kv);
+    snprintf(num, sizeof num, "chat_id=%" PRId64, chat);
+    cfg_put(&cfg, "data-urlencode", num);
+    buf_add(&kv, "text=", 5);
+    buf_add(&kv, text, strlen(text));
+    cfg_put(&cfg, "data-urlencode", kv.data);
     cfg_put(&cfg, "max-time", "20");
 
     rc = run_curl(&cfg, &out);
     if (rc != 0)
         logf_("sendMessage to chat %" PRId64 " failed", chat);
     buf_free(&cfg);
+    buf_free(&kv);
     buf_free(&out);
     return rc;
 }
@@ -559,6 +565,7 @@ static void cmd_help(int64_t chat) {
           "/ip list - show IP registry\n"
           "/ip enable <ip> - mark an IP as enabled\n"
           "/ip disable <ip> - mark an IP as disabled\n"
+          "/commands - list all commands\n"
           "/help - this message\n"
           "Note: the IP registry is informational. No firewall rules are changed.",
           SRCT_VERSION);
@@ -695,6 +702,252 @@ static void split_command(const char *text, char *cmd, size_t cn, char *arg, siz
         arg[--n] = '\0';
 }
 
+/* ------------------------------------------------------------------------- */
+/* Table commands: fixed files and fixed programs. Never a shell.            */
+/* ------------------------------------------------------------------------- */
+
+#define CMD_TIMEOUT_S 5
+#define READ_MAX 65536
+#define OUT_MAX 3500 /* body cap, well under Telegram's 4096 characters */
+#define CHUNK_MAX 3500
+#define EXIT_NOT_FOUND 127
+#define EXIT_TIMEOUT 124
+
+/* Splits a fixed target such as "ps -eo pid,comm" into argv. No quoting. */
+static bool split_argv(const char *target, char *store, size_t n, char **argv, int max) {
+    size_t len = strlen(target);
+    int k = 0;
+    char *p;
+
+    if (len + 1 > n)
+        return false;
+    memcpy(store, target, len + 1);
+    p = store;
+    for (;;) {
+        while (*p == ' ')
+            *p++ = '\0';
+        if (*p == '\0')
+            break;
+        if (k >= max - 1)
+            return false;
+        argv[k++] = p;
+        while (*p && *p != ' ')
+            p++;
+    }
+    argv[k] = NULL;
+    return k > 0;
+}
+
+/*
+ * Runs a fixed program (no shell), capturing stdout and stderr up to READ_MAX.
+ * Returns the exit status, EXIT_TIMEOUT if killed by the alarm, or -1 on error.
+ */
+static int run_argv(const char *target, buf_t *out) {
+    char store[256];
+    char *argv[16];
+    int pfd[2];
+    pid_t pid;
+    int status = 0;
+    char chunk[4096];
+
+    if (!split_argv(target, store, sizeof store, argv, 16))
+        return -1;
+    if (pipe(pfd) < 0)
+        return -1;
+
+    pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        static const char missing[] = "command not available on this host\n";
+        int nul = open("/dev/null", O_RDONLY);
+
+        if (nul >= 0) {
+            dup2(nul, STDIN_FILENO);
+            close(nul);
+        }
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[0]);
+        close(pfd[1]);
+        alarm(CMD_TIMEOUT_S);
+        execvp(argv[0], argv);
+        {
+            ssize_t w = write(STDOUT_FILENO, missing, sizeof missing - 1);
+            (void)w; /* best effort: the child exits either way */
+        }
+        _exit(EXIT_NOT_FOUND);
+    }
+
+    close(pfd[1]);
+    for (;;) {
+        ssize_t r = read(pfd[0], chunk, sizeof chunk);
+
+        if (r < 0) {
+            if (errno == EINTR) {
+                if (g_stop)
+                    break;
+                continue;
+            }
+            break;
+        }
+        if (r == 0)
+            break;
+        if (out->len < READ_MAX) {
+            size_t take = (size_t)r;
+
+            if (take > READ_MAX - out->len)
+                take = READ_MAX - out->len;
+            buf_add(out, chunk, take);
+        }
+        /* Beyond READ_MAX we keep draining so the child never blocks. */
+    }
+    close(pfd[0]);
+
+    if (g_stop)
+        kill(pid, SIGTERM);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+        ;
+    if (WIFSIGNALED(status))
+        return EXIT_TIMEOUT;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return -1;
+}
+
+/* Reads at most READ_MAX bytes of a fixed file. Returns false if unreadable. */
+static bool read_file_capped(const char *path, buf_t *out) {
+    FILE *f = fopen(path, "r");
+    char chunk[4096];
+
+    if (!f)
+        return false;
+    for (;;) {
+        size_t n;
+        size_t take;
+
+        if (out->len >= READ_MAX)
+            break;
+        n = fread(chunk, 1, sizeof chunk, f);
+        if (n == 0)
+            break;
+        take = n;
+        if (take > READ_MAX - out->len)
+            take = READ_MAX - out->len;
+        buf_add(out, chunk, take);
+    }
+    fclose(f);
+    return true;
+}
+
+/* Byte index to cut a UTF-8 string at, never inside a multi-byte character. */
+static size_t utf8_cut(const char *s, size_t len, size_t max) {
+    if (len <= max)
+        return len;
+    while (max > 0 && ((unsigned char)s[max] & 0xC0) == 0x80)
+        max--;
+    return max;
+}
+
+/* Sends text in chunks of whole lines, each under Telegram's limit. */
+static void send_long(int64_t chat, const char *text) {
+    buf_t chunk = {0};
+    const char *p = text;
+
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) + 1 : strlen(p);
+
+        if (chunk.len && chunk.len + len > CHUNK_MAX) {
+            tg_send_text(chat, chunk.data);
+            buf_free(&chunk);
+        }
+        buf_add(&chunk, p, len);
+        p += len;
+    }
+    if (chunk.len)
+        tg_send_text(chat, chunk.data);
+    buf_free(&chunk);
+}
+
+static const rct_cmd_def *find_table_cmd(const char *name) {
+    for (int i = 0; i < RCT_NCOMMANDS; i++)
+        if (RCT_COMMANDS[i].kind != 'b' && strcmp(RCT_COMMANDS[i].name, name) == 0)
+            return &RCT_COMMANDS[i];
+    return NULL;
+}
+
+static void run_table_command(int64_t chat, const rct_cmd_def *def) {
+    buf_t body = {0};
+    buf_t msg = {0};
+    char note[32] = "";
+    size_t n;
+    size_t cut;
+    char head[80];
+
+    if (def->kind == 'f') {
+        if (!read_file_capped(def->target, &body)) {
+            reply(chat, "Not available on this host: %s", def->target);
+            buf_free(&body);
+            return;
+        }
+    } else {
+        int status = run_argv(def->target, &body);
+
+        if (status == EXIT_TIMEOUT)
+            snprintf(note, sizeof note, "(timed out)");
+        else if (status > 0 && status != EXIT_NOT_FOUND)
+            snprintf(note, sizeof note, "(exit %d)", status);
+        else if (status < 0) {
+            reply(chat, "Could not run /%s", def->name);
+            buf_free(&body);
+            return;
+        }
+    }
+
+    /* Trim trailing whitespace, then add any status note. */
+    n = body.len;
+    while (n > 0 && (body.data[n - 1] == '\n' || body.data[n - 1] == '\r' ||
+                     body.data[n - 1] == ' ' || body.data[n - 1] == '\t'))
+        n--;
+    body.len = n;
+    if (note[0]) {
+        buf_add(&body, "\n", 1);
+        buf_add(&body, note, strlen(note));
+    }
+
+    snprintf(head, sizeof head, "/%s\n", def->name);
+    buf_add(&msg, head, strlen(head));
+    if (body.len == 0) {
+        buf_add(&msg, "(no output)", 11);
+    } else {
+        cut = utf8_cut(body.data, body.len, OUT_MAX);
+        buf_add(&msg, body.data, cut);
+        if (cut < body.len)
+            buf_add(&msg, "\n... (truncated)", 16);
+    }
+    tg_send_text(chat, msg.data);
+    buf_free(&body);
+    buf_free(&msg);
+}
+
+static void cmd_commands(int64_t chat) {
+    buf_t list = {0};
+    char line[256];
+
+    snprintf(line, sizeof line, "Commands (%d):\n", RCT_NCOMMANDS);
+    buf_add(&list, line, strlen(line));
+    for (int i = 0; i < RCT_NCOMMANDS; i++) {
+        snprintf(line, sizeof line, "/%s - %s\n", RCT_COMMANDS[i].name, RCT_COMMANDS[i].desc);
+        buf_add(&list, line, strlen(line));
+    }
+    send_long(chat, list.data);
+    buf_free(&list);
+}
+
 static void handle_message(int64_t chat, const char *text) {
     char cmd[64];
     char arg[MAX_TEXT];
@@ -739,12 +992,20 @@ static void handle_message(int64_t chat, const char *text) {
     }
     c->session_until = now + g_session_s; /* sliding idle timeout */
 
-    if (strcmp(cmd, "/status") == 0)
+    if (strcmp(cmd, "/status") == 0) {
         cmd_status(chat);
-    else if (strcmp(cmd, "/ip") == 0)
+    } else if (strcmp(cmd, "/ip") == 0) {
         cmd_ip(chat, arg);
-    else
-        reply(chat, "Unknown command. Send /help for the list.");
+    } else if (strcmp(cmd, "/commands") == 0) {
+        cmd_commands(chat);
+    } else {
+        const rct_cmd_def *def = find_table_cmd(cmd + 1);
+
+        if (def)
+            run_table_command(chat, def);
+        else
+            reply(chat, "Unknown command. Send /help for the list.");
+    }
 }
 
 /* ------------------------------------------------------------------------- */

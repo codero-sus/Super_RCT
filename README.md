@@ -22,6 +22,32 @@ password login before running any command.
 | `/ip list` | Show the IP registry |
 | `/ip enable <ip>` | Mark an IPv4/IPv6 address as enabled |
 | `/ip disable <ip>` | Mark an IPv4/IPv6 address as disabled |
+| `/commands` | List every command with a one-line description |
+
+### Read-only system commands (113)
+
+After `/auth`, these commands return live information from the host. Each one
+is either a fixed file read or a fixed program with fixed arguments. None
+accepts user input, and none runs through a shell.
+
+| Group | Examples |
+| --- | --- |
+| Memory, CPU, kernel | `/meminfo`, `/cpuinfo`, `/loadavg`, `/kversion`, `/pressure_mem`, `/vmstat` |
+| Hardware and power | `/lsblk`, `/df`, `/free`, `/lsusb`, `/lspci`, `/sensors`, `/thermal`, `/battery` |
+| Kernel tunables | `/sys_swappiness`, `/sys_ip_forward`, `/sys_randomize`, `/sys_file_max` |
+| Network | `/ip_addr`, `/ip_route`, `/ss_listen`, `/ss_established`, `/net_tcp`, `/net_dev` |
+| Processes and services | `/ps`, `/ps_mem`, `/top`, `/systemd_running`, `/systemd_failed`, `/journal_errors` |
+| Users, time, identity | `/date`, `/uptime`, `/who`, `/whoami`, `/os_release`, `/machine_id`, `/timezone` |
+
+Every command is defined in `src/commands.def`. The C and Python tables are
+generated from that file (`make gen`). The test suite fails if they are stale.
+
+Commands run with a 5-second time limit. Output is capped at about 3.5 KB and
+sent in several messages if a listing is long.
+
+Adding a command means adding one line to `src/commands.def` and running
+`make gen`. Adding a shell command is deliberately not supported. A shell
+command would let anyone who gets past `/auth` run anything on the host.
 
 The IP registry is stored in a plain text file (`super_rct_ips.txt` by default).
 It is informational: Super_RCT does not change firewall rules. Arbitrary shell

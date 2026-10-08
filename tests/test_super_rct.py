@@ -21,6 +21,8 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+from commands_table import COMMANDS  # noqa: E402  (generated from src/commands.def)
 C_BINARY = os.environ.get("SUPER_RCT_BINARY") or os.path.join(ROOT, "build", "super_rct")
 PY_SCRIPT = os.path.join(ROOT, "src", "super_rct.py")
 
@@ -163,7 +165,8 @@ class BotCases:
         if cls.command[0] == C_BINARY and not os.path.exists(C_BINARY):
             raise unittest.SkipTest("build/super_rct missing; run `make` first")
 
-    def run_bot(self, batches, expect_replies, chat=ALLOWED_CHAT, timeout=20, **env):
+    def run_bot(self, batches, expect_replies, chat=ALLOWED_CHAT, timeout=20,
+                settle=0.3, **env):
         """Runs the bot until `expect_replies` replies reach `chat`, then stops it."""
         self.tmp = tempfile.mkdtemp()
         self.ipfile = os.path.join(self.tmp, "ips.txt")
@@ -178,7 +181,7 @@ class BotCases:
                 if len(mock.replies_to(chat)) >= expect_replies or proc.poll() is not None:
                     break
                 time.sleep(0.05)
-            time.sleep(0.3)  # let any stray replies land
+            time.sleep(settle)  # let any further replies land
             proc.send_signal(signal.SIGTERM)
             try:
                 _, err = proc.communicate(timeout=10)
@@ -253,6 +256,41 @@ class BotCases:
                      expect_replies=1)
         self.assertEqual(self.stranger_replies, [])
         self.assertEqual(len(self.replies), 1)
+
+    # -- table commands (files and fixed programs) ---------------------------
+
+    def test_table_commands_require_auth(self):
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, "/meminfo")]],
+                               expect_replies=1)
+        self.assertEqual(replies, ["Not authenticated. Send /auth <password> first."])
+
+    def test_file_and_program_outputs(self):
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/meminfo"),
+            make_update(3, ALLOWED_CHAT, "/uname"),
+            make_update(4, ALLOWED_CHAT, "/nosuchcmd"),
+            make_update(5, ALLOWED_CHAT, "/sys_nonexistent_knob"),
+        ]], expect_replies=5)
+        self.assertTrue(replies[1].startswith("/meminfo\n"), replies[1][:80])
+        self.assertIn("MemTotal:", replies[1])
+        self.assertTrue(replies[2].startswith("/uname\n"), replies[2][:80])
+        self.assertIn("Linux", replies[2])
+        self.assertEqual(replies[3], "Unknown command. Send /help for the list.")
+        self.assertEqual(replies[4], "Unknown command. Send /help for the list.")
+
+    def test_commands_listing_matches_generated_table(self):
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, AUTH),
+                                 make_update(2, ALLOWED_CHAT, "/commands")]],
+                               expect_replies=2, settle=1.0)
+        text = "".join(replies[1:])
+        self.assertTrue(text.startswith(f"Commands ({len(COMMANDS)}):\n"), text[:80])
+        for name, _kind, _target, desc in COMMANDS:
+            self.assertIn(f"/{name} - {desc}\n", text)
+        real = [c for c in COMMANDS if c[1] != "b"]
+        self.assertGreaterEqual(len(real), 99)
+        for chunk in replies[1:]:
+            self.assertLessEqual(len(chunk), 4096)
 
     # -- commands and registry ----------------------------------------------
 
@@ -348,6 +386,14 @@ class CBotTests(BotCases, unittest.TestCase):
 
 class PythonBotTests(BotCases, unittest.TestCase):
     command = [sys.executable, PY_SCRIPT]
+
+
+
+class GeneratedTableTests(unittest.TestCase):
+    def test_generated_tables_are_current(self):
+        res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_commands.py"),
+                              "--check"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
 
 if __name__ == "__main__":
