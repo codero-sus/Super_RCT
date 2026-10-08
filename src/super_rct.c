@@ -3,25 +3,28 @@
  *
  * Features
  *   - Long-polls the Telegram Bot API with getUpdates.
- *   - Only chats listed in SUPER_RCT_CHAT_IDS may issue commands.
+ *   - Only chats listed in SUPER_RCT_CHAT_IDS may talk to the bot.
+ *   - Password login per chat: /auth <password>, idle-timeout sessions,
+ *     /logout, and a lockout after repeated wrong passwords.
  *   - Built-in commands: /help, /status, /ip list|enable|disable.
  *   - Keeps an IP registry (enabled/disabled) in a plain text file.
  *
  * Design notes
  *   - POSIX only (Linux, macOS, BSD). No runtime libraries besides libc.
- *   - HTTPS is delegated to the system `curl` executable. This avoids the
- *     need for libcurl development headers. Requests are passed to curl
- *     through its config-file interface on stdin, so the bot token never
- *     appears in the process list.
+ *   - HTTPS is delegated to the system `curl` executable. Requests are
+ *     passed to curl through its config-file interface on stdin, so the
+ *     bot token and password never appear in the process list.
  *   - JSON is parsed with a small depth-aware reader that only understands
  *     the subset of fields the bot needs.
  *   - No arbitrary shell execution is offered, by design.
  *
  * Configuration (environment variables)
- *   SUPER_RCT_TOKEN      Telegram bot token (required)
- *   SUPER_RCT_CHAT_IDS   Comma-separated list of allowed chat IDs (required)
- *   SUPER_RCT_IP_FILE    IP registry file (default: super_rct_ips.txt)
- *   SUPER_RCT_API        API base URL (default: https://api.telegram.org)
+ *   SUPER_RCT_TOKEN            Telegram bot token (required)
+ *   SUPER_RCT_CHAT_IDS         Comma-separated allowed chat IDs (required)
+ *   SUPER_RCT_PASSWORD         Login password, 8-128 bytes (required)
+ *   SUPER_RCT_SESSION_SECONDS  Idle timeout for a login (default 3600)
+ *   SUPER_RCT_IP_FILE          IP registry file (default: super_rct_ips.txt)
+ *   SUPER_RCT_API              API base URL (default: https://api.telegram.org)
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -43,10 +46,15 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SRCT_VERSION "0.2.0"
+#define SRCT_VERSION "0.3.0"
 
 #define DEFAULT_API "https://api.telegram.org"
 #define DEFAULT_IP_FILE "super_rct_ips.txt"
+#define DEFAULT_SESSION_S 3600
+#define MIN_SESSION_S 5
+#define MAX_SESSION_S 86400
+#define MIN_PASSWORD 8
+#define MAX_PASSWORD 128
 #define MAX_TOKEN 256
 #define MAX_URL 512
 #define MAX_CHATS 32
@@ -54,8 +62,9 @@
 #define MAX_TEXT 1024
 #define IP_LEN 64
 #define POLL_TIMEOUT_S 25
-#define HTTP_MAX_TIME_S 40
 #define RETRY_DELAY_S 5
+#define MAX_FAILS 3
+#define LOCKOUT_S 300
 
 /* ------------------------------------------------------------------------- */
 /* Global state                                                              */
@@ -66,12 +75,21 @@ typedef struct {
     bool enabled;
 } ip_entry;
 
+typedef struct {
+    int64_t chat;
+    time_t session_until; /* logged in while now < session_until */
+    int fails;            /* consecutive wrong passwords */
+    time_t locked_until;  /* refuses /auth while now < locked_until */
+} chat_state;
+
 static volatile sig_atomic_t g_stop = 0;
 static time_t g_started;
 static char g_token[MAX_TOKEN];
+static char g_password[MAX_PASSWORD + 1];
 static char g_api[MAX_URL] = DEFAULT_API;
 static char g_ipfile[MAX_URL] = DEFAULT_IP_FILE;
-static int64_t g_chats[MAX_CHATS];
+static long g_session_s = DEFAULT_SESSION_S;
+static chat_state g_chats[MAX_CHATS];
 static int g_nchats;
 static int64_t g_offset;
 static ip_entry g_ips[MAX_IPS];
@@ -271,6 +289,7 @@ static int tg_get_updates(buf_t *out) {
     snprintf(kv, sizeof kv, "offset=%" PRId64, g_offset);
     cfg_put(&cfg, "data-urlencode", kv);
     cfg_put(&cfg, "max-time", "40");
+
     rc = run_curl(&cfg, out);
     buf_free(&cfg);
     return rc;
@@ -478,6 +497,8 @@ static bool ip_save(void) {
 static bool ip_normalise(const char *in, char *out, size_t n) {
     unsigned char buf[sizeof(struct in6_addr)];
 
+    if (strchr(in, '%'))
+        return false; /* no scope IDs */
     if (inet_pton(AF_INET, in, buf) == 1)
         return inet_ntop(AF_INET, buf, out, (socklen_t)n) != NULL;
     if (inet_pton(AF_INET6, in, buf) == 1)
@@ -486,14 +507,37 @@ static bool ip_normalise(const char *in, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Authentication                                                            */
+/* ------------------------------------------------------------------------- */
+
+/* Compares two strings without leaking where they first differ. */
+static bool ct_equal(const char *a, const char *b) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    size_t n = la > lb ? la : lb;
+    unsigned char diff = (unsigned char)(la != lb);
+
+    for (size_t i = 0; i < n; i++) {
+        unsigned char ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned char cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= (unsigned char)(ca ^ cb);
+    }
+    return diff == 0;
+}
+
+static bool session_active(const chat_state *c, time_t now) {
+    return c->session_until > now;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Command handlers                                                          */
 /* ------------------------------------------------------------------------- */
 
-static bool chat_allowed(int64_t chat) {
+static int chat_index(int64_t chat) {
     for (int i = 0; i < g_nchats; i++)
-        if (g_chats[i] == chat)
-            return true;
-    return false;
+        if (g_chats[i].chat == chat)
+            return i;
+    return -1;
 }
 
 static void reply(int64_t chat, const char *fmt, ...) {
@@ -509,6 +553,8 @@ static void reply(int64_t chat, const char *fmt, ...) {
 static void cmd_help(int64_t chat) {
     reply(chat,
           "Super_RCT %s commands:\n"
+          "/auth <password> - log in (required before other commands)\n"
+          "/logout - end your session\n"
           "/status - host status\n"
           "/ip list - show IP registry\n"
           "/ip enable <ip> - mark an IP as enabled\n"
@@ -516,6 +562,43 @@ static void cmd_help(int64_t chat) {
           "/help - this message\n"
           "Note: the IP registry is informational. No firewall rules are changed.",
           SRCT_VERSION);
+}
+
+static void cmd_auth(chat_state *c, const char *arg, time_t now) {
+    if (c->locked_until > now) {
+        reply(c->chat, "Too many failed attempts. Try again in %ld s.",
+              (long)(c->locked_until - now));
+        return;
+    }
+    if (arg[0] == '\0') {
+        reply(c->chat, "Usage: /auth <password>");
+        return;
+    }
+    if (ct_equal(arg, g_password)) {
+        c->fails = 0;
+        c->session_until = now + g_session_s;
+        logf_("chat %" PRId64 " authenticated", c->chat);
+        reply(c->chat, "Authenticated. Session expires after %ld s of inactivity.",
+              g_session_s);
+        return;
+    }
+
+    c->fails++;
+    logf_("failed login for chat %" PRId64 " (%d/%d)", c->chat, c->fails, MAX_FAILS);
+    if (c->fails >= MAX_FAILS) {
+        c->fails = 0;
+        c->session_until = 0;
+        c->locked_until = now + LOCKOUT_S;
+        reply(c->chat, "Wrong password. Too many failed attempts; locked for %d s.",
+              LOCKOUT_S);
+    } else {
+        reply(c->chat, "Wrong password (%d/%d failed attempts).", c->fails, MAX_FAILS);
+    }
+}
+
+static void cmd_logout(chat_state *c) {
+    c->session_until = 0;
+    reply(c->chat, "Logged out.");
 }
 
 static void cmd_status(int64_t chat) {
@@ -528,7 +611,12 @@ static void cmd_status(int64_t chat) {
           g_nips);
 }
 
-static void cmd_ip(int64_t chat, const char *sub, const char *arg) {
+static void cmd_ip(int64_t chat, const char *args) {
+    char sub[64] = "";
+    char ip_in[128] = "";
+
+    (void)sscanf(args, "%63s %127s", sub, ip_in);
+
     if (sub[0] == '\0' || strcmp(sub, "list") == 0) {
         char list[MAX_TEXT] = "";
         size_t used = 0;
@@ -553,12 +641,12 @@ static void cmd_ip(int64_t chat, const char *sub, const char *arg) {
         char ip[IP_LEN];
         ip_entry *e;
 
-        if (arg[0] == '\0') {
+        if (ip_in[0] == '\0') {
             reply(chat, "Usage: /ip %s <ip>", sub);
             return;
         }
-        if (!ip_normalise(arg, ip, sizeof ip)) {
-            reply(chat, "Invalid IP address: %s", arg);
+        if (!ip_normalise(ip_in, ip, sizeof ip)) {
+            reply(chat, "Invalid IP address: %s", ip_in);
             return;
         }
         e = ip_find(ip);
@@ -583,17 +671,46 @@ static void cmd_ip(int64_t chat, const char *sub, const char *arg) {
     reply(chat, "Usage: /ip list | /ip enable <ip> | /ip disable <ip>");
 }
 
-static void handle_message(int64_t chat, const char *text) {
-    char cmd[64] = "";
-    char sub[64] = "";
-    char arg[128] = "";
-    char *at;
+/*
+ * Splits "/cmd rest of line" into the command word and the trimmed remainder.
+ * The remainder keeps internal spaces, so passwords may contain spaces.
+ */
+static void split_command(const char *text, char *cmd, size_t cn, char *arg, size_t an) {
+    const char *p = text;
+    size_t i = 0;
+    size_t n;
 
-    if (!chat_allowed(chat)) {
+    while (*p == ' ' || *p == '\t')
+        p++;
+    while (*p && *p != ' ' && *p != '\t' && i + 1 < cn)
+        cmd[i++] = *p++;
+    cmd[i] = '\0';
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    snprintf(arg, an, "%s", p);
+    n = strlen(arg);
+    while (n > 0 && (arg[n - 1] == ' ' || arg[n - 1] == '\t' ||
+                     arg[n - 1] == '\r' || arg[n - 1] == '\n'))
+        arg[--n] = '\0';
+}
+
+static void handle_message(int64_t chat, const char *text) {
+    char cmd[64];
+    char arg[MAX_TEXT];
+    char *at;
+    time_t now = time(NULL);
+    int idx = chat_index(chat);
+    chat_state *c;
+
+    if (idx < 0) {
         logf_("ignored message from unauthorised chat %" PRId64, chat);
         return;
     }
-    if (sscanf(text, " %63s %63s %127s", cmd, sub, arg) < 1 || cmd[0] != '/')
+    c = &g_chats[idx];
+
+    split_command(text, cmd, sizeof cmd, arg, sizeof arg);
+    if (cmd[0] != '/')
         return;
 
     /* Groups send commands as /cmd@BotName. */
@@ -603,12 +720,29 @@ static void handle_message(int64_t chat, const char *text) {
 
     logf_("command %s from chat %" PRId64, cmd, chat);
 
-    if (strcmp(cmd, "/start") == 0 || strcmp(cmd, "/help") == 0)
+    if (strcmp(cmd, "/start") == 0 || strcmp(cmd, "/help") == 0) {
         cmd_help(chat);
-    else if (strcmp(cmd, "/status") == 0)
+        return;
+    }
+    if (strcmp(cmd, "/auth") == 0) {
+        cmd_auth(c, arg, now);
+        return;
+    }
+    if (strcmp(cmd, "/logout") == 0) {
+        cmd_logout(c);
+        return;
+    }
+
+    if (!session_active(c, now)) {
+        reply(chat, "Not authenticated. Send /auth <password> first.");
+        return;
+    }
+    c->session_until = now + g_session_s; /* sliding idle timeout */
+
+    if (strcmp(cmd, "/status") == 0)
         cmd_status(chat);
     else if (strcmp(cmd, "/ip") == 0)
-        cmd_ip(chat, sub, arg);
+        cmd_ip(chat, arg);
     else
         reply(chat, "Unknown command. Send /help for the list.");
 }
@@ -641,7 +775,8 @@ static void handle_update(const char *u) {
     handle_message(chat_id, text);
 }
 
-static void handle_response(const char *json) {
+/* Returns false if Telegram reported an error (the caller should back off). */
+static bool handle_response(const char *json) {
     const char *ok = json_get(json, "ok");
     const char *result = json_get(json, "result");
     const char *p;
@@ -653,10 +788,10 @@ static void handle_response(const char *json) {
         if (desc)
             json_str(desc, d, sizeof d);
         logf_("Telegram returned an error: %s", d[0] ? d : "(no description)");
-        return;
+        return false;
     }
     if (!result || *result != '[')
-        return;
+        return true;
 
     p = result + 1;
     for (;;) {
@@ -671,6 +806,7 @@ static void handle_response(const char *json) {
         else
             break;
     }
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -696,9 +832,23 @@ static bool valid_token(const char *t) {
     return true;
 }
 
+static bool parse_long(const char *s, long *out) {
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || errno != 0)
+        return false;
+    *out = v;
+    return true;
+}
+
 static bool load_config(void) {
     const char *tok = getenv("SUPER_RCT_TOKEN");
     const char *chats = getenv("SUPER_RCT_CHAT_IDS");
+    const char *pw = getenv("SUPER_RCT_PASSWORD");
+    const char *sess = getenv("SUPER_RCT_SESSION_SECONDS");
     const char *api = getenv("SUPER_RCT_API");
     const char *ipf = getenv("SUPER_RCT_IP_FILE");
 
@@ -707,6 +857,24 @@ static bool load_config(void) {
         return false;
     }
     strcpy(g_token, tok);
+
+    if (!pw || strlen(pw) < MIN_PASSWORD || strlen(pw) > MAX_PASSWORD) {
+        fprintf(stderr, "error: SUPER_RCT_PASSWORD is required (%d-%d bytes)\n",
+                MIN_PASSWORD, MAX_PASSWORD);
+        return false;
+    }
+    strcpy(g_password, pw);
+
+    if (sess && *sess) {
+        long v;
+
+        if (!parse_long(sess, &v) || v < MIN_SESSION_S || v > MAX_SESSION_S) {
+            fprintf(stderr, "error: SUPER_RCT_SESSION_SECONDS must be %d-%d\n",
+                    MIN_SESSION_S, MAX_SESSION_S);
+            return false;
+        }
+        g_session_s = v;
+    }
 
     if (!chats || !*chats) {
         fprintf(stderr, "error: SUPER_RCT_CHAT_IDS is required (comma-separated)\n");
@@ -726,7 +894,8 @@ static bool load_config(void) {
                 fprintf(stderr, "error: bad chat id list in SUPER_RCT_CHAT_IDS\n");
                 return false;
             }
-            g_chats[g_nchats++] = (int64_t)v;
+            g_chats[g_nchats].chat = (int64_t)v;
+            g_nchats++;
             p = end;
             while (*p == ' ' || *p == '\t')
                 p++;
@@ -766,11 +935,13 @@ static void usage(FILE *out) {
             "Super_RCT %s - Telegram remote-control bot\n\n"
             "Usage: super_rct [--help] [--version]\n\n"
             "Environment:\n"
-            "  SUPER_RCT_TOKEN      bot token (required)\n"
-            "  SUPER_RCT_CHAT_IDS   allowed chat IDs, comma-separated (required)\n"
-            "  SUPER_RCT_IP_FILE    IP registry file (default %s)\n"
-            "  SUPER_RCT_API        API base URL (default %s)\n",
-            SRCT_VERSION, DEFAULT_IP_FILE, DEFAULT_API);
+            "  SUPER_RCT_TOKEN            bot token (required)\n"
+            "  SUPER_RCT_CHAT_IDS         allowed chat IDs, comma-separated (required)\n"
+            "  SUPER_RCT_PASSWORD         login password, 8-128 bytes (required)\n"
+            "  SUPER_RCT_SESSION_SECONDS  idle timeout for a login (default %d)\n"
+            "  SUPER_RCT_IP_FILE          IP registry file (default %s)\n"
+            "  SUPER_RCT_API              API base URL (default %s)\n",
+            SRCT_VERSION, DEFAULT_SESSION_S, DEFAULT_IP_FILE, DEFAULT_API);
 }
 
 int main(int argc, char **argv) {
@@ -819,7 +990,8 @@ int main(int argc, char **argv) {
             sleep_interruptible(RETRY_DELAY_S);
             continue;
         }
-        handle_response(resp.data);
+        if (!handle_response(resp.data))
+            sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
         buf_free(&resp);
     }
 
