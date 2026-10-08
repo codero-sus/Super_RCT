@@ -24,6 +24,7 @@
  *   SUPER_RCT_PASSWORD         Login password, 8-128 bytes (required)
  *   SUPER_RCT_SESSION_SECONDS  Idle timeout for a login (default 3600)
  *   SUPER_RCT_IP_FILE          IP registry file (default: super_rct_ips.txt)
+ *   SUPER_RCT_STATE_FILE      saved alert and report settings (default: super_rct_state.txt)
  *   SUPER_RCT_API              API base URL (default: https://api.telegram.org)
  */
 
@@ -53,6 +54,7 @@
 
 #define DEFAULT_API "https://api.telegram.org"
 #define DEFAULT_IP_FILE "super_rct_ips.txt"
+#define DEFAULT_STATE_FILE "super_rct_state.txt"
 #define DEFAULT_SESSION_S 3600
 #define MIN_SESSION_S 5
 #define MAX_SESSION_S 86400
@@ -98,6 +100,7 @@ static char g_token[MAX_TOKEN];
 static char g_password[MAX_PASSWORD + 1];
 static char g_api[MAX_URL] = DEFAULT_API;
 static char g_ipfile[MAX_URL] = DEFAULT_IP_FILE;
+static char g_statefile[MAX_URL] = DEFAULT_STATE_FILE;
 static long g_session_s = DEFAULT_SESSION_S;
 static chat_state g_chats[MAX_CHATS];
 static int g_nchats;
@@ -1149,6 +1152,7 @@ static bool load_config(void) {
     const char *sess = getenv("SUPER_RCT_SESSION_SECONDS");
     const char *api = getenv("SUPER_RCT_API");
     const char *ipf = getenv("SUPER_RCT_IP_FILE");
+    const char *sf = getenv("SUPER_RCT_STATE_FILE");
 
     if (!tok || !valid_token(tok)) {
         fprintf(stderr, "error: SUPER_RCT_TOKEN is missing or malformed\n");
@@ -1334,6 +1338,14 @@ static bool load_config(void) {
         }
         strcpy(g_ipfile, ipf);
     }
+    if (sf && *sf) {
+        if (strlen(sf) >= sizeof g_statefile) {
+            fprintf(stderr, "error: SUPER_RCT_STATE_FILE is too long\n");
+            return false;
+        }
+        strcpy(g_statefile, sf);
+    }
+    load_state(); /* after the path is known */
     return true;
 }
 

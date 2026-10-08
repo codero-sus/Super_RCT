@@ -53,11 +53,12 @@ The IP registry is stored in a plain text file (`super_rct_ips.txt` by default).
 It is informational: Super_RCT does not change firewall rules. Arbitrary shell
 execution is deliberately not offered.
 
-## Monitoring and utilities (28)
+## Monitoring and utilities (29)
 
 All of these need `/auth` first. Both variants give the same replies, except that `/about` names the variant.
 
-- **Health**: `/health` (summary), `/mem`, `/swap`, `/disk`, `/load`, `/temp`,
+- **Health**: `/health` (summary), `/diagnose` (each check marked OK, WARN or
+  FAIL, with a result line), `/mem`, `/swap`, `/disk`, `/load`, `/temp`,
   `/cpu` (1 s sample), `/net_rate` (1 s sample), `/procs`, `/uptime_h`,
   `/failed_units`, `/updates_count` (apt), `/reboot_required`.
 - **Alerts**: `/alert list`, `/alert set mem|disk|temp|load <value>`,
@@ -76,8 +77,10 @@ All of these need `/auth` first. Both variants give the same replies, except tha
   `/echo`, `/botstats`, `/sessions`, `/logout_all`, `/about`, `/selftest`,
   `/config` (never shows the token or password).
 
-Alert limits, reports, reminders and counters are kept in memory. They reset
-when the bot restarts. Nothing here captures the screen, camera, microphone,
+Alert limits and report schedules are saved to `SUPER_RCT_STATE_FILE` (default
+`super_rct_state.txt`) after each change, written with mode 0600, and restored
+on restart. Reminders and counters are kept in memory and reset when the bot
+restarts. Nothing here captures the screen, camera, microphone,
 keyboard or clipboard, and nothing runs an arbitrary shell command.
 
 ## Authentication
@@ -178,6 +181,7 @@ Environment variables:
 | `SUPER_RCT_PASSWORD` | yes (8-128 bytes) | - |
 | `SUPER_RCT_SESSION_SECONDS` | no (5-86400) | `3600` |
 | `SUPER_RCT_IP_FILE` | no | `super_rct_ips.txt` |
+| `SUPER_RCT_STATE_FILE` | no | `super_rct_state.txt` |
 | `SUPER_RCT_API` | no | `https://api.telegram.org` |
 | `SUPER_RCT_WATCH_PATHS` | no (comma-separated absolute paths, max 16) | - |
 | `SUPER_RCT_WATCH_MAX_AGE_HOURS` | no (1-8760) | `24` |

@@ -11,6 +11,7 @@ LDFLAGS ?=
 BUILD   := build
 TARGET  := $(BUILD)/super_rct
 SRC     := src/super_rct.c
+DEPS    := $(wildcard src/*.h)
 
 RELFLAGS := -Os -s -ffunction-sections -fdata-sections
 RELLDFLAGS := -Wl,--gc-sections
@@ -19,11 +20,11 @@ RELLDFLAGS := -Wl,--gc-sections
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) | $(BUILD)
+$(TARGET): $(SRC) $(DEPS) | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
 
 # Smallest binary: stripped, size-optimised, dead code removed.
-release: $(SRC) | $(BUILD)
+release: $(SRC) $(DEPS) | $(BUILD)
 	$(CC) -std=c11 $(RELFLAGS) -Wall -Wextra -Wpedantic $(LDFLAGS) $(RELLDFLAGS) -o $(TARGET) $(SRC)
 
 $(BUILD):

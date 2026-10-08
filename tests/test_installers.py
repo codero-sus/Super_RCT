@@ -77,6 +77,10 @@ class InstallerCases:
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("Already installed", again.stdout)
 
+        # Bot data written at run time must go too, even though the manifest does not list it.
+        for name in ("super_rct_state.txt", "super_rct_ips.txt"):
+            with open(os.path.join(self.work, name), "w", encoding="utf-8") as f:
+                f.write("")
         res = self.run_installer("uninstall")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         leftovers = sorted(os.listdir(self.work))

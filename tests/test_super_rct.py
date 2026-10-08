@@ -253,6 +253,7 @@ class BotCases:
         with MockTelegram(batches) as mock:
             env.setdefault("SUPER_RCT_API", mock.url)
             env.setdefault("SUPER_RCT_IP_FILE", self.ipfile)
+            env.setdefault("SUPER_RCT_STATE_FILE", os.path.join(self.tmp, "state.txt"))
             proc = subprocess.Popen(self.command, env=base_env(**env),
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True)
@@ -489,6 +490,38 @@ class BotCases:
 
     # -- monitoring and utilities (all behind /auth) -------------------------
 
+    def test_settings_survive_restart(self):
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        first = [[make_update(1, ALLOWED_CHAT, AUTH),
+                  make_update(2, ALLOWED_CHAT, "/alert set mem 91"),
+                  make_update(3, ALLOWED_CHAT, "/alert set load 3.5"),
+                  make_update(4, ALLOWED_CHAT, "/report on 30")]]
+        self.run_bot(first, expect_replies=4, SUPER_RCT_STATE_FILE=state)
+        self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+
+        second = [[make_update(1, ALLOWED_CHAT, AUTH),
+                   make_update(2, ALLOWED_CHAT, "/alert list"),
+                   make_update(3, ALLOWED_CHAT, "/report status")]]
+        replies = self.run_bot(second, expect_replies=3, SUPER_RCT_STATE_FILE=state)
+        text = "\n".join(replies)
+        self.assertIn("mem: 91", text)
+        self.assertIn("load: 3.5", text)
+        self.assertIn("Health reports every 30 minutes", text)
+
+    def test_damaged_state_line_is_skipped(self):
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        with open(state, "w", encoding="utf-8") as f:
+            f.write("# header\n"
+                    "42 garbage here\n"
+                    "42 -1 -1 -1 -1 0 extra\n"
+                    "42 95 -1 -1 -1 0\n"
+                    "7 50 -1 -1 -1 0\n")  # chat 7 is allowed, values are fine
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, AUTH),
+                                 make_update(2, ALLOWED_CHAT, "/alert list")]],
+                               expect_replies=2, SUPER_RCT_STATE_FILE=state)
+        self.assertIn("mem: 95", "\n".join(replies))
+        self.assertIn("warning", self.stderr)
+
     def test_monitoring_requires_auth(self):
         replies = self.run_bot([[make_update(1, ALLOWED_CHAT, "/health")]], expect_replies=1)
         self.assertEqual(replies, ["Not authenticated. Send /auth <password> first."])
@@ -499,6 +532,9 @@ class BotCases:
             ("/auth wrong-password", None),
             ("/botstats", "Failed logins: 1"),
             ("/health", f"Health (Super_RCT {VERSION})"),
+            ("/diagnose", r"re:^Diagnosis \(Super_RCT \d+\.\d+\.\d+\)\n"
+                         r"(?:(?:OK|WARN|FAIL|INFO) +.*\n)*"
+                         r"Result: \d+ failure\(s\), \d+ warning\(s\)\n"),
             ("/mem", "Memory"),
             ("/load", "Load:"),
             ("/uptime_h", "Up "),

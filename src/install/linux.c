@@ -29,6 +29,11 @@
 #define BOT_NAME "super_rct"
 #define ENV_NAME "super_rct.env"
 #define MANIFEST "super_rct_install.txt"
+/* Data the bot writes into its directory at run time; uninstall removes these too. */
+static const char *const RUNTIME_FILES[] = {
+    "super_rct_state.txt", "super_rct_state.txt.tmp",
+    "super_rct_ips.txt", "super_rct_ips.txt.tmp",
+};
 #define UNIT_NAME "super-rct.service"
 #define PATHBUF (PATH_MAX * 2)
 
@@ -360,6 +365,10 @@ static int uninstall(void) {
             printf("Removed %s\n", arg);
     }
     fclose(m);
+    for (size_t i = 0; i < sizeof RUNTIME_FILES / sizeof RUNTIME_FILES[0]; i++) {
+        if (unlink(RUNTIME_FILES[i]) == 0)
+            printf("Removed %s (bot data)\n", RUNTIME_FILES[i]);
+    }
     unlink(MANIFEST);
     printf("Uninstalled. This installer file was left in place.\n");
     return 0;

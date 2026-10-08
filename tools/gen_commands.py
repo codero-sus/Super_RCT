@@ -21,7 +21,7 @@ OUT_PY = os.path.join(ROOT, "src", "commands_table.py")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 BUILTINS = {
     "help", "commands", "auth", "logout", "status", "ip",
-    "health", "mem", "swap", "disk", "load", "temp", "cpu", "net_rate", "procs",
+    "health", "diagnose", "mem", "swap", "disk", "load", "temp", "cpu", "net_rate", "procs",
     "uptime_h", "failed_units", "updates_count", "reboot_required", "alert",
     "report", "remind", "timers", "timer_cancel", "watch", "watch_check",
     "notify", "echo", "botstats", "sessions", "logout_all", "about", "selftest",
