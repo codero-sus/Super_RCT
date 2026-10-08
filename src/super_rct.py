@@ -346,7 +346,7 @@ class Bot:
                 with open(target, "rb") as f:
                     data = f.read(READ_MAX)
             except OSError:
-                self.reply(chat, f"Not available on this host: {target}")
+                self.reply(chat, f"/{name}\nNot available on this host: {target}")
                 return
         else:
             try:

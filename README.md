@@ -24,7 +24,7 @@ password login before running any command.
 | `/ip disable <ip>` | Mark an IPv4/IPv6 address as disabled |
 | `/commands` | List every command with a one-line description |
 
-### Read-only system commands (113)
+### Read-only system commands (235)
 
 After `/auth`, these commands return live information from the host. Each one
 is either a fixed file read or a fixed program with fixed arguments. None
