@@ -19,11 +19,14 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from commands_table import COMMANDS
 
 VERSION = "0.3.0"
 DEFAULT_API = "https://api.telegram.org"
@@ -41,6 +44,10 @@ SEND_TIMEOUT_S = 20
 RETRY_DELAY_S = 5
 MAX_FAILS = 3
 LOCKOUT_S = 300
+CMD_TIMEOUT_S = 5
+READ_MAX = 65536
+OUT_MAX = 3500  # body cap, well under Telegram's 4096 characters
+CHUNK_MAX = 3500
 
 
 class ConfigError(Exception):
@@ -78,6 +85,7 @@ HELP_TEXT = (
     "/ip list - show IP registry\n"
     "/ip enable <ip> - mark an IP as enabled\n"
     "/ip disable <ip> - mark an IP as disabled\n"
+    "/commands - list all commands\n"
     "/help - this message\n"
     "Note: the IP registry is informational. No firewall rules are changed."
 )
@@ -210,6 +218,31 @@ class IpRegistry:
             return None
 
 
+def utf8_cut(data, max_len):
+    """Byte index to cut `data` at, never inside a multi-byte character."""
+    if len(data) <= max_len:
+        return len(data)
+    cut = max_len
+    while cut > 0 and (data[cut] & 0xC0) == 0x80:
+        cut -= 1
+    return cut
+
+
+def chunk_lines(text, limit=CHUNK_MAX):
+    """Splits text into chunks of whole lines, each at most `limit` bytes."""
+    chunks, current, current_len = [], [], 0
+    for line in text.splitlines(keepends=True):
+        size = len(line.encode())
+        if current and current_len + size > limit:
+            chunks.append("".join(current))
+            current, current_len = [], 0
+        current.append(line)
+        current_len += size
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 class Bot:
     def __init__(self, cfg):
         self.tg = Telegram(cfg["api"], cfg["token"])
@@ -305,6 +338,50 @@ class Bot:
 
         self.reply(chat, "Usage: /ip list | /ip enable <ip> | /ip disable <ip>")
 
+    def run_table(self, chat, name, kind, target):
+        """Runs a table command: a fixed file or a fixed program, never a shell."""
+        note = ""
+        if kind == "f":
+            try:
+                with open(target, "rb") as f:
+                    data = f.read(READ_MAX)
+            except OSError:
+                self.reply(chat, f"Not available on this host: {target}")
+                return
+        else:
+            try:
+                proc = subprocess.run(target.split(), stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      timeout=CMD_TIMEOUT_S)
+                data, status = proc.stdout, proc.returncode
+            except FileNotFoundError:
+                data, status = b"command not available on this host\n", 127
+            except subprocess.TimeoutExpired as err:
+                data, status = (err.stdout or b""), 124
+            data = data[:READ_MAX]
+            if status == 124:
+                note = "(timed out)"
+            elif status not in (0, 127):
+                note = f"(exit {status})"
+
+        body = data.rstrip(b" \t\r\n").decode("utf-8", "replace")
+        if note:
+            body += "\n" + note
+        if not body:
+            body = "(no output)"
+
+        raw = body.encode()
+        cut = utf8_cut(raw, OUT_MAX)
+        if cut < len(raw):
+            body = raw[:cut].decode("utf-8", "replace") + "\n... (truncated)"
+        self.reply(chat, f"/{name}\n{body}")
+
+    def cmd_commands(self, chat):
+        lines = [f"Commands ({len(COMMANDS)}):\n"]
+        lines += [f"/{name} - {desc}\n" for name, _kind, _target, desc in COMMANDS]
+        for chunk in chunk_lines("".join(lines)):
+            self.reply(chat, chunk)
+
     def handle_message(self, chat, text):
         st = self.chats.get(chat)
         if st is None:
@@ -341,8 +418,14 @@ class Bot:
                 self.cmd_status(chat)
             elif cmd == "/ip":
                 self.cmd_ip(chat, arg)
+            elif cmd == "/commands":
+                self.cmd_commands(chat)
             else:
-                self.reply(chat, "Unknown command. Send /help for the list.")
+                entry = next((c for c in COMMANDS if c[1] != "b" and c[0] == cmd[1:]), None)
+                if entry is None:
+                    self.reply(chat, "Unknown command. Send /help for the list.")
+                else:
+                    self.run_table(chat, *entry[:3])
 
     def handle_update(self, update):
         uid = update.get("update_id")
