@@ -49,7 +49,7 @@
 
 #include "commands_table.h"
 
-#define SRCT_VERSION "0.3.0"
+#define SRCT_VERSION "0.4.0"
 
 #define DEFAULT_API "https://api.telegram.org"
 #define DEFAULT_IP_FILE "super_rct_ips.txt"
@@ -83,6 +83,10 @@ typedef struct {
     time_t session_until; /* logged in while now < session_until */
     int fails;            /* consecutive wrong passwords */
     time_t locked_until;  /* refuses /auth while now < locked_until */
+    double thr[4];        /* alert limits: mem, disk, temp, load (-1 = off) */
+    bool fired[4];        /* alert currently raised */
+    time_t report_every;  /* scheduled health report interval, 0 = off */
+    time_t report_next;
 } chat_state;
 
 static volatile sig_atomic_t g_stop = 0;
@@ -97,6 +101,12 @@ static int g_nchats;
 static int64_t g_offset;
 static ip_entry g_ips[MAX_IPS];
 static int g_nips;
+#define MAX_WATCH 16
+static char g_watch[MAX_WATCH][MAX_URL];
+static int g_nwatch;
+static long g_watch_max_h = 24;
+static unsigned long g_cmds_handled;
+static unsigned long g_auth_failures;
 
 /* ------------------------------------------------------------------------- */
 /* Logging                                                                   */
@@ -591,6 +601,7 @@ static void cmd_auth(chat_state *c, const char *arg, time_t now) {
     }
 
     c->fails++;
+    g_auth_failures++;
     logf_("failed login for chat %" PRId64 " (%d/%d)", c->chat, c->fails, MAX_FAILS);
     if (c->fails >= MAX_FAILS) {
         c->fails = 0;
@@ -742,16 +753,12 @@ static bool split_argv(const char *target, char *store, size_t n, char **argv, i
  * Runs a fixed program (no shell), capturing stdout and stderr up to READ_MAX.
  * Returns the exit status, EXIT_TIMEOUT if killed by the alarm, or -1 on error.
  */
-static int run_argv(const char *target, buf_t *out) {
-    char store[256];
-    char *argv[16];
+static int run_argv_vec(char *const *argv, buf_t *out) {
     int pfd[2];
     pid_t pid;
     int status = 0;
     char chunk[4096];
 
-    if (!split_argv(target, store, sizeof store, argv, 16))
-        return -1;
     if (pipe(pfd) < 0)
         return -1;
 
@@ -816,6 +823,15 @@ static int run_argv(const char *target, buf_t *out) {
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
     return -1;
+}
+
+static int run_argv(const char *target, buf_t *out) {
+    char store[256];
+    char *argv[16];
+
+    if (!split_argv(target, store, sizeof store, argv, 16))
+        return -1;
+    return run_argv_vec(argv, out);
 }
 
 /* Reads at most READ_MAX bytes of a fixed file. Returns false if unreadable. */
@@ -948,6 +964,8 @@ static void cmd_commands(int64_t chat) {
     buf_free(&list);
 }
 
+#include "monitor.h"
+
 static void handle_message(int64_t chat, const char *text) {
     char cmd[64];
     char arg[MAX_TEXT];
@@ -961,6 +979,7 @@ static void handle_message(int64_t chat, const char *text) {
         return;
     }
     c = &g_chats[idx];
+    g_cmds_handled++;
 
     split_command(text, cmd, sizeof cmd, arg, sizeof arg);
     if (cmd[0] != '/')
@@ -991,6 +1010,9 @@ static void handle_message(int64_t chat, const char *text) {
         return;
     }
     c->session_until = now + g_session_s; /* sliding idle timeout */
+
+    if (monitor_dispatch(chat, c, cmd, arg, now))
+        return;
 
     if (strcmp(cmd, "/status") == 0) {
         cmd_status(chat);
@@ -1170,6 +1192,53 @@ static bool load_config(void) {
         }
     }
 
+    for (int i = 0; i < g_nchats; i++)
+        for (int k = 0; k < 4; k++)
+            g_chats[i].thr[k] = -1.0;
+
+    {
+        const char *wp = getenv("SUPER_RCT_WATCH_PATHS");
+        const char *wa = getenv("SUPER_RCT_WATCH_MAX_AGE_HOURS");
+
+        if (wp && *wp) {
+            char *copy = strdup(wp);
+            char *save = NULL;
+            char *wtok;
+
+            if (!copy)
+                return false;
+            for (wtok = strtok_r(copy, ",", &save); wtok; wtok = strtok_r(NULL, ",", &save)) {
+                size_t len;
+
+                while (*wtok == ' ')
+                    wtok++;
+                len = strlen(wtok);
+                while (len > 0 && wtok[len - 1] == ' ')
+                    wtok[--len] = '\0';
+                if (len == 0)
+                    continue;
+                if (wtok[0] != '/' || len >= MAX_URL || g_nwatch >= MAX_WATCH) {
+                    fprintf(stderr, "error: SUPER_RCT_WATCH_PATHS needs absolute paths (max %d)\n",
+                            MAX_WATCH);
+                    free(copy);
+                    return false;
+                }
+                snprintf(g_watch[g_nwatch], MAX_URL, "%s", wtok);
+                g_nwatch++;
+            }
+            free(copy);
+        }
+        if (wa && *wa) {
+            long v;
+
+            if (!parse_long(wa, &v) || v < 1 || v > 8760) {
+                fprintf(stderr, "error: SUPER_RCT_WATCH_MAX_AGE_HOURS must be 1-8760\n");
+                return false;
+            }
+            g_watch_max_h = v;
+        }
+    }
+
     if (api && *api) {
         if (strncmp(api, "https://", 8) != 0 && strncmp(api, "http://", 7) != 0) {
             fprintf(stderr, "error: SUPER_RCT_API must start with https:// or http://\n");
@@ -1201,6 +1270,8 @@ static void usage(FILE *out) {
             "  SUPER_RCT_PASSWORD         login password, 8-128 bytes (required)\n"
             "  SUPER_RCT_SESSION_SECONDS  idle timeout for a login (default %d)\n"
             "  SUPER_RCT_IP_FILE          IP registry file (default %s)\n"
+            "  SUPER_RCT_WATCH_PATHS      comma-separated paths to watch (optional)\n"
+            "  SUPER_RCT_WATCH_MAX_AGE_HOURS  watched file is stale after N hours (default 24)\n"
             "  SUPER_RCT_API              API base URL (default %s)\n",
             SRCT_VERSION, DEFAULT_SESSION_S, DEFAULT_IP_FILE, DEFAULT_API);
 }
@@ -1254,6 +1325,7 @@ int main(int argc, char **argv) {
         if (!handle_response(resp.data))
             sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
         buf_free(&resp);
+        monitor_tick(time(NULL));
     }
 
     logf_("Super_RCT stopped");

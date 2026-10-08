@@ -53,6 +53,33 @@ The IP registry is stored in a plain text file (`super_rct_ips.txt` by default).
 It is informational: Super_RCT does not change firewall rules. Arbitrary shell
 execution is deliberately not offered.
 
+## Monitoring and utilities (28)
+
+All of these need `/auth` first. Both variants give the same replies, except that `/about` names the variant.
+
+- **Health**: `/health` (summary), `/mem`, `/swap`, `/disk`, `/load`, `/temp`,
+  `/cpu` (1 s sample), `/net_rate` (1 s sample), `/procs`, `/uptime_h`,
+  `/failed_units`, `/updates_count` (apt), `/reboot_required`.
+- **Alerts**: `/alert list`, `/alert set mem|disk|temp|load <value>`,
+  `/alert off <metric>`, `/alert check`. The bot checks every 60 seconds and
+  sends `ALERT` once when a limit is reached and `RECOVERED` once it drops back
+  below the limit minus a margin (5 points, or 0.2 for load). Limits: mem and
+  disk 1-100 %, temp 20-120 C, load 0.1-100 per core.
+- **Reports**: `/report status`, `/report on <5-1440 minutes>`, `/report off`,
+  `/report now`.
+- **Reminders**: `/remind <1-10080 minutes> <text>`, `/timers`,
+  `/timer_cancel <id>`. Up to 10 per chat and 32 in total.
+- **Watched files**: `/watch` and `/watch_check` report the age of the paths in
+  `SUPER_RCT_WATCH_PATHS` and flag any older than
+  `SUPER_RCT_WATCH_MAX_AGE_HOURS`.
+- **Utilities**: `/notify <text>` (desktop notification through `notify-send`),
+  `/echo`, `/botstats`, `/sessions`, `/logout_all`, `/about`, `/selftest`,
+  `/config` (never shows the token or password).
+
+Alert limits, reports, reminders and counters are kept in memory. They reset
+when the bot restarts. Nothing here captures the screen, camera, microphone,
+keyboard or clipboard, and nothing runs an arbitrary shell command.
+
 ## Authentication
 
 Every chat must first send `/auth <password>`. Then:
@@ -115,6 +142,8 @@ Environment variables:
 | `SUPER_RCT_SESSION_SECONDS` | no (5-86400) | `3600` |
 | `SUPER_RCT_IP_FILE` | no | `super_rct_ips.txt` |
 | `SUPER_RCT_API` | no | `https://api.telegram.org` |
+| `SUPER_RCT_WATCH_PATHS` | no (comma-separated absolute paths, max 16) | - |
+| `SUPER_RCT_WATCH_MAX_AGE_HOURS` | no (1-8760) | `24` |
 
 Keep the token out of version control. Put it in your shell environment or a
 secrets manager, not in a committed file.
@@ -136,6 +165,9 @@ secrets manager, not in a committed file.
 ```
 src/super_rct.c         the bot, C variant
 src/super_rct.py       the bot, Python variant (same behaviour)
-Makefile               build, release, test, size
+src/monitor.h          monitoring and utility commands, C variant
+src/monitor.py         monitoring and utility commands, Python variant
+src/commands.def       command table (source); generates commands_table.h/.py
+Makefile               build, release, test, size, gen, check-gen
 tests/test_super_rct.py integration tests (both variants) against a mock Telegram API
 ```
