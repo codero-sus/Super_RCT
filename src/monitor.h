@@ -580,6 +580,133 @@ static void send_health(int64_t chat) {
 /* Background work: alerts, scheduled reports and reminders                  */
 /* ------------------------------------------------------------------------- */
 
+static const char *grade(double v, double warn, double fail) {
+    if (v >= fail)
+        return "FAIL";
+    if (v >= warn)
+        return "WARN";
+    return "OK";
+}
+
+/* 10-second average of 'some' pressure (percent) from /proc/pressure. */
+static bool read_psi_some(const char *name, double *out) {
+    char path[128];
+    char line[256];
+    FILE *f;
+    bool found = false;
+
+    snprintf(path, sizeof path, "/proc/pressure/%s", name);
+    f = fopen(path, "r");
+    if (!f)
+        return false;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "some ", 5) == 0) {
+            const char *p = strstr(line, "avg10=");
+
+            if (p) {
+                *out = strtod(p + 6, NULL);
+                found = true;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void diag_line(buf_t *b, int *warnings, int *failures, const char *level,
+                      const char *text) {
+    bappendf(b, "%-4s %s\n", level, text);
+    if (strcmp(level, "WARN") == 0)
+        (*warnings)++;
+    else if (strcmp(level, "FAIL") == 0)
+        (*failures)++;
+}
+
+/* Checks the same readings as /health, and gives each one a verdict. */
+static void build_diagnose(buf_t *b) {
+    double mem_pct = 0;
+    double swap_pct = 0;
+    double l1 = 0;
+    double l5 = 0;
+    double l15 = 0;
+    double temp = 0;
+    double psi = 0;
+    long mt;
+    long mu;
+    long st;
+    long su;
+    disk_t disks[MAX_DISKS];
+    int nd;
+    int worst = -1;
+    int warnings = 0;
+    int failures = 0;
+    char t[200];
+    buf_t out = {0};
+    char *fu[] = {"systemctl", "--failed", "--no-legend", "--plain", NULL};
+    char *tu[] = {"timedatectl", "show", "-p", "NTPSynchronized", "--value", NULL};
+    char *ua[] = {"apt", "list", "--upgradable", NULL};
+
+    bappendf(b, "Diagnosis (Super_RCT %s)\n", SRCT_VERSION);
+
+    if (read_meminfo(&mem_pct, &swap_pct, &mt, &mu, &st, &su)) {
+        snprintf(t, sizeof t, "Memory %.1f%% used", mem_pct);
+        diag_line(b, &warnings, &failures, grade(mem_pct, 90, 97), t);
+        if (st > 0) {
+            snprintf(t, sizeof t, "Swap %.1f%% used", swap_pct);
+            diag_line(b, &warnings, &failures, grade(swap_pct, 50, 80), t);
+        }
+    }
+    if (read_psi_some("memory", &psi)) {
+        snprintf(t, sizeof t, "Memory pressure (10 s) %.2f%%", psi);
+        diag_line(b, &warnings, &failures, grade(psi, 10, 25), t);
+    }
+    nd = disk_scan(disks, MAX_DISKS);
+    for (int i = 0; i < nd; i++)
+        if (worst < 0 || disks[i].pct > disks[worst].pct)
+            worst = i;
+    if (worst >= 0) {
+        snprintf(t, sizeof t, "Disk %.1f%% used on %s", disks[worst].pct, disks[worst].mount);
+        diag_line(b, &warnings, &failures, grade(disks[worst].pct, 90, 98), t);
+    }
+    if (read_load(&l1, &l5, &l15)) {
+        double per_core = l1 / (double)ncpus();
+
+        snprintf(t, sizeof t, "Load %.2f per core", per_core);
+        diag_line(b, &warnings, &failures, grade(per_core, 1.0, 2.0), t);
+    }
+    if (read_temp_c(&temp)) {
+        snprintf(t, sizeof t, "Temperature %.1f C (hottest zone)", temp);
+        diag_line(b, &warnings, &failures, grade(temp, 80, 90), t);
+    }
+    if (capture_ok(fu, &out)) {
+        int failed = count_lines(&out, "");
+
+        snprintf(t, sizeof t, "Failed units: %d", failed);
+        diag_line(b, &warnings, &failures, grade(failed, 1, 3), t);
+    }
+    free(out.data);
+    out = (buf_t){0};
+    if (capture_ok(tu, &out)) {
+        bool synced = out.data && strncmp(out.data, "yes", 3) == 0;
+
+        diag_line(b, &warnings, &failures, synced ? "OK" : "WARN",
+                  synced ? "Clock is synchronised" : "Clock is not synchronised");
+    }
+    free(out.data);
+    out = (buf_t){0};
+    if (access("/var/run/reboot-required", F_OK) == 0)
+        diag_line(b, &warnings, &failures, "WARN", "Reboot required");
+    if (capture_ok(ua, &out)) {
+        int updates = count_lines(&out, "[upgradable");
+
+        snprintf(t, sizeof t, "Updates available: %d", updates);
+        diag_line(b, &warnings, &failures, updates ? "INFO" : "OK", t);
+    }
+    free(out.data);
+    bappendf(b, "Result: %d failure(s), %d warning(s)\n", failures, warnings);
+}
+
 static void monitor_tick(time_t now) {
     bool any_alert = false;
 
@@ -779,6 +906,117 @@ static void cmd_reboot_required(int64_t chat) {
           access("/var/run/reboot-required", F_OK) == 0 ? "yes" : "no");
 }
 
+#define STATE_HEADER \
+    "# Super_RCT settings (saved by the bot; do not edit while it runs).\n" \
+    "# chat mem disk temp load report_minutes   (-1 = alert off, 0 = no report)\n"
+
+static bool state_value_ok(int m, double v) {
+    return v == -1.0 || (v >= 0 && metric_range(m, v));
+}
+
+/* Applies saved alert limits and report intervals. A missing file is normal on
+ * first run. Bad lines are skipped with a warning, so one damaged line cannot
+ * stop the bot starting. */
+static void load_state(void) {
+    FILE *f = fopen(g_statefile, "r");
+    char line[256];
+
+    if (!f)
+        return;
+    while (fgets(line, sizeof line, f)) {
+        long long chat;
+        double thr[METRIC_COUNT];
+        long mins;
+        int used = 0;
+        int n;
+        const char *rest;
+        chat_state *c = NULL;
+
+        if (line[0] == '#' || line[0] == '\n')
+            continue;
+        n = sscanf(line, "%lld %lf %lf %lf %lf %ld%n", &chat, &thr[0], &thr[1],
+                   &thr[2], &thr[3], &mins, &used);
+        rest = line + used;
+        if (n != 6 || rest[strspn(rest, " \t\r\n")] != '\0') {
+            fprintf(stderr, "warning: skipping bad line in %s\n", g_statefile);
+            continue;
+        }
+        for (int i = 0; i < g_nchats; i++) {
+            if (g_chats[i].chat == (int64_t)chat)
+                c = &g_chats[i];
+        }
+        if (!c)
+            continue; /* chat no longer allowed in the config */
+
+        {
+            bool ok = (mins == 0 || (mins >= REPORT_MIN_MIN && mins <= REPORT_MAX_MIN));
+
+            for (int k = 0; k < METRIC_COUNT; k++)
+                ok = ok && state_value_ok(k, thr[k]);
+            if (!ok) {
+                fprintf(stderr, "warning: skipping out-of-range settings for chat %lld in %s\n",
+                        chat, g_statefile);
+                continue;
+            }
+        }
+        for (int k = 0; k < METRIC_COUNT; k++) {
+            c->thr[k] = thr[k];
+            c->fired[k] = false;
+        }
+        c->report_every = (time_t)mins * 60;
+        c->report_next = time(NULL) + c->report_every;
+    }
+    fclose(f);
+}
+
+/* Writes non-default settings atomically with mode 0600. */
+static bool save_state(void) {
+    char tmp[MAX_URL + 8];
+    int fd;
+    FILE *f;
+    bool ok;
+
+    snprintf(tmp, sizeof tmp, "%s.tmp", g_statefile);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
+        return false;
+    f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(tmp);
+        return false;
+    }
+    fputs(STATE_HEADER, f);
+    for (int i = 0; i < g_nchats; i++) {
+        const chat_state *c = &g_chats[i];
+        bool any = c->report_every > 0;
+
+        for (int k = 0; k < METRIC_COUNT; k++) {
+            if (c->thr[k] >= 0)
+                any = true;
+        }
+        if (!any)
+            continue;
+        fprintf(f, "%lld", (long long)c->chat);
+        for (int k = 0; k < METRIC_COUNT; k++)
+            fprintf(f, " %.17g", c->thr[k]);
+        fprintf(f, " %ld\n", (long)(c->report_every / 60));
+    }
+    ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0)
+        ok = false;
+    if (!ok || rename(tmp, g_statefile) != 0) {
+        unlink(tmp);
+        return false;
+    }
+    return true;
+}
+
+static void persist_settings(int64_t chat) {
+    if (!save_state())
+        reply(chat, "Warning: settings could not be saved and will reset on restart.");
+}
+
 static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
     char sub[16] = "";
     char name[16] = "";
@@ -822,6 +1060,7 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
         }
         c->thr[m] = v;
         c->fired[m] = false;
+        persist_settings(chat);
         reply(chat, "Alert for %s set; you will be notified when it is reached.", name);
         return;
     }
@@ -834,6 +1073,7 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
         }
         c->thr[m] = -1;
         c->fired[m] = false;
+        persist_settings(chat);
         reply(chat, "Alert for %s turned off.", name);
         return;
     }
@@ -896,11 +1136,13 @@ static void cmd_report(int64_t chat, chat_state *c, const char *arg, time_t now)
         }
         c->report_every = (time_t)mins * 60;
         c->report_next = now + c->report_every;
+        persist_settings(chat);
         reply(chat, "Health reports on: every %ld minutes.", mins);
         return;
     }
     if (strcmp(sub, "off") == 0) {
         c->report_every = 0;
+        persist_settings(chat);
         reply(chat, "Scheduled reports turned off.");
         return;
     }
@@ -1171,6 +1413,13 @@ static bool monitor_dispatch(int64_t chat, chat_state *c, const char *cmd, const
                              time_t now) {
     if (strcmp(cmd, "/health") == 0)
         send_health(chat);
+    else if (strcmp(cmd, "/diagnose") == 0) {
+        buf_t b = {0};
+
+        build_diagnose(&b);
+        reply_buf(chat, &b);
+        buf_free(&b);
+    }
     else if (strcmp(cmd, "/mem") == 0)
         cmd_mem(chat);
     else if (strcmp(cmd, "/swap") == 0)

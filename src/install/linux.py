@@ -26,6 +26,9 @@ PAYLOAD = ""  # replaced by tools/build_installers.py with the bot bundle (zip, 
 ENV_FILE = "super_rct.env"
 MANIFEST = "super_rct_install.txt"
 UNIT_NAME = "super-rct.service"
+# Data the bot writes into its directory at run time; uninstall removes these too.
+RUNTIME_FILES = ("super_rct_state.txt", "super_rct_state.txt.tmp",
+                 "super_rct_ips.txt", "super_rct_ips.txt.tmp")
 
 
 def ask(prompt, secret=False, required=True):
@@ -151,6 +154,11 @@ def uninstall():
             if os.path.isfile(target):
                 os.remove(target)
                 print(f"Removed {name}")
+    for name in RUNTIME_FILES:
+        target = os.path.join(here, name)
+        if os.path.isfile(target):
+            os.remove(target)
+            print(f"Removed {name} (bot data)")
     cache = os.path.join(here, "__pycache__")
     if os.path.isdir(cache) and all(n.endswith(".pyc") for n in os.listdir(cache)):
         shutil.rmtree(cache)

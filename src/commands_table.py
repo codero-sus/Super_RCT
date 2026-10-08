@@ -244,6 +244,7 @@ COMMANDS = (
     ('docker_containers', 'c', 'docker ps', 'Running Docker containers'),
     ('docker_images', 'c', 'docker images', 'Docker images'),
     ('health', 'b', '', 'Health summary: CPU, memory, disk, load, temp'),
+    ('diagnose', 'b', '', 'Health checks with OK, WARN or FAIL for each item'),
     ('mem', 'b', '', 'Memory usage'),
     ('swap', 'b', '', 'Swap usage'),
     ('disk', 'b', '', 'Disk usage with percentages'),

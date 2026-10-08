@@ -10,6 +10,7 @@ Configuration (environment variables)
   SUPER_RCT_PASSWORD         Login password, 8-128 bytes (required)
   SUPER_RCT_SESSION_SECONDS  Idle timeout for a login (default 3600)
   SUPER_RCT_IP_FILE          IP registry file (default super_rct_ips.txt)
+  SUPER_RCT_STATE_FILE       saved alert and report settings (default super_rct_state.txt)
   SUPER_RCT_API              API base URL (default https://api.telegram.org)
   SUPER_RCT_DISCORD_TOKEN    Discord bot token (optional)
   SUPER_RCT_DISCORD_CHANNEL_IDS  allowed Discord channel IDs (required with a Discord token)
@@ -33,11 +34,12 @@ import urllib.request
 
 from commands_table import COMMANDS
 from discord_transport import DEFAULT_DISCORD_API, Discord, DiscordError
-from monitor import CMD_TIMEOUT_S, MonitorMixin
+from monitor import CMD_TIMEOUT_S, MonitorMixin, load_state
 
 VERSION = "0.5.0"
 DEFAULT_API = "https://api.telegram.org"
 DEFAULT_IP_FILE = "super_rct_ips.txt"
+DEFAULT_STATE_FILE = "super_rct_state.txt"
 DEFAULT_SESSION_S = 3600
 MIN_SESSION_S = 5
 MAX_SESSION_S = 86400
@@ -85,6 +87,7 @@ def usage_text():
         "  SUPER_RCT_PASSWORD         login password, 8-128 bytes (required)\n"
         f"  SUPER_RCT_SESSION_SECONDS  idle timeout for a login (default {DEFAULT_SESSION_S})\n"
         f"  SUPER_RCT_IP_FILE          IP registry file (default {DEFAULT_IP_FILE})\n"
+        f"  SUPER_RCT_STATE_FILE       saved alert and report settings (default {DEFAULT_STATE_FILE})\n"
         "  SUPER_RCT_WATCH_PATHS      comma-separated paths to watch (optional)\n"
         f"  SUPER_RCT_WATCH_MAX_AGE_HOURS  watched file is stale after N hours "
         f"(default {DEFAULT_WATCH_MAX_H})\n"
@@ -194,6 +197,7 @@ def load_config(env):
         "token": token,
         "password": password,
         "session_s": session_s,
+        "state_file": env.get("SUPER_RCT_STATE_FILE", "") or DEFAULT_STATE_FILE,
         "chats": chats,
         "api": api.rstrip("/"),
         "ip_file": ip_file,
@@ -312,6 +316,7 @@ class Bot(MonitorMixin):
         self.session_s = cfg["session_s"]
         self.chats = {c: ChatState(c) for c in cfg["chats"]}
         self.chats.update({c: ChatState(c, discord=True) for c in cfg["discord_chats"]})
+        load_state(cfg["state_file"], self.chats)
         self.discord = (Discord(cfg["discord_token"], cfg["discord_api"])
                         if cfg["discord_token"] else None)
         self.next_discord_poll = 0

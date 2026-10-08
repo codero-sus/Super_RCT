@@ -10,6 +10,7 @@ version. Standard library only.
 import os
 import re
 import subprocess
+import sys
 import time
 
 from commands_table import COMMANDS
@@ -259,9 +260,97 @@ def _text(data):
 # The mixin
 # ---------------------------------------------------------------------------
 
+STATE_HEADER = ("# Super_RCT settings (saved by the bot; do not edit while it runs).\n"
+                "# chat mem disk temp load report_minutes   (-1 = alert off, 0 = no report)\n")
+
+
+def load_state(path, chats):
+    """Applies saved alert limits and report intervals to `chats`.
+
+    A missing file is normal on first run. Bad lines are skipped with a
+    warning on stderr, so one damaged line cannot stop the bot starting.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        print(f"warning: cannot read {path}: {err}", file=sys.stderr)
+        return
+    for line in lines:
+        parts = line.split()
+        if not parts or parts[0].startswith("#"):
+            continue
+        try:
+            chat = int(parts[0])
+            thr = [float(x) for x in parts[1:5]]
+            minutes = int(parts[5])
+            if len(parts) != 6:
+                raise ValueError("wrong field count")
+        except ValueError:
+            print(f"warning: skipping bad line in {path}", file=sys.stderr)
+            continue
+        st = chats.get(chat)
+        if st is None:
+            continue  # chat no longer allowed in the config
+        ok = all(t == -1.0 or (t >= 0 and metric_range(k, t)) for k, t in enumerate(thr))
+        ok = ok and (minutes == 0 or REPORT_MIN_MIN <= minutes <= REPORT_MAX_MIN)
+        if not ok:
+            print(f"warning: skipping out-of-range settings for chat {chat} in {path}",
+                  file=sys.stderr)
+            continue
+        st.thr = thr
+        st.fired = [False] * 4
+        st.report_every = minutes * 60
+
+
+def save_state(path, chats):
+    """Writes non-default settings atomically with mode 0600. Returns False on failure."""
+    lines = [STATE_HEADER.rstrip("\n")]
+    for chat, st in sorted(chats.items()):
+        if all(t < 0 for t in st.thr) and st.report_every <= 0:
+            continue
+        fields = [str(chat)] + [repr(t) for t in st.thr] + [str(st.report_every // 60)]
+        lines.append(" ".join(fields))
+    tmp = path + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def grade(value, warn, fail):
+    """OK, WARN or FAIL for a reading against its warning and failure limits."""
+    if value >= fail:
+        return "FAIL"
+    if value >= warn:
+        return "WARN"
+    return "OK"
+
+
+def read_psi_some(name):
+    """10-second average of 'some' pressure (percent) from /proc/pressure, or None."""
+    try:
+        with open(f"/proc/pressure/{name}", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("some "):
+                    for field in line.split():
+                        if field.startswith("avg10="):
+                            return float(field[len("avg10="):])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 class MonitorMixin:
     def init_monitor(self, cfg, version):
         self.version = version
+        self.state_file = cfg["state_file"]
         self.api_url = cfg["api"]
         self.watch_paths = list(cfg["watch_paths"])
         self.watch_max_h = cfg["watch_max_h"]
@@ -357,6 +446,56 @@ class MonitorMixin:
 
     def send_health(self, chat):
         self.reply_long(chat, self.build_health())
+
+    def build_diagnose(self):
+        """Checks the same readings as /health, and gives each one a verdict."""
+        rows = []  # (level, text); "n/a" readings are left out
+        mi = read_meminfo()
+        if mi:
+            rows.append((grade(mi["mem_pct"], 90, 97), f"Memory {mi['mem_pct']:.1f}% used"))
+            if mi["swap_total_mb"] > 0:
+                rows.append((grade(mi["swap_pct"], 50, 80),
+                             f"Swap {mi['swap_pct']:.1f}% used"))
+        psi = read_psi_some("memory")
+        if psi is not None:
+            rows.append((grade(psi, 10, 25), f"Memory pressure (10 s) {psi:.2f}%"))
+        disks = disk_scan()
+        if disks:
+            worst = max(disks, key=lambda d: d[2])
+            rows.append((grade(worst[2], 90, 98),
+                         f"Disk {worst[2]:.1f}% used on {worst[0]}"))
+        load = read_load()
+        if load:
+            per_core = load[0] / ncpus()
+            rows.append((grade(per_core, 1.0, 2.0), f"Load {per_core:.2f} per core"))
+        temp = read_temp_c()
+        if temp is not None:
+            rows.append((grade(temp, 80, 90), f"Temperature {temp:.1f} C (hottest zone)"))
+        status, out = run_argv(["systemctl", "--failed", "--no-legend", "--plain"])
+        if status == 0:
+            failed = count_lines(_text(out), "")
+            rows.append((grade(failed, 1, 3), f"Failed units: {failed}"))
+        status, out = run_argv(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
+        if status == 0:
+            synced = _text(out).strip() == "yes"
+            rows.append(("OK" if synced else "WARN",
+                         "Clock is synchronised" if synced else "Clock is not synchronised"))
+        if os.path.exists("/var/run/reboot-required"):
+            rows.append(("WARN", "Reboot required"))
+        status, out = run_argv(["apt", "list", "--upgradable"])
+        if status == 0:
+            updates = count_lines(_text(out), "[upgradable")
+            rows.append(("INFO" if updates else "OK", f"Updates available: {updates}"))
+
+        warnings = sum(1 for level, _ in rows if level == "WARN")
+        failures = sum(1 for level, _ in rows if level == "FAIL")
+        lines = [f"Diagnosis (Super_RCT {self.version})"]
+        lines += [f"{level:<4} {text}" for level, text in rows]
+        lines.append(f"Result: {failures} failure(s), {warnings} warning(s)")
+        return "\n".join(lines) + "\n"
+
+    def send_diagnose(self, chat):
+        self.reply_long(chat, self.build_diagnose())
 
     def monitor_tick(self, now):
         """Called from the main loop: alerts, scheduled reports, reminders."""
@@ -474,6 +613,10 @@ class MonitorMixin:
         self.reply(chat, "Reboot required: "
                          + ("yes" if os.path.exists("/var/run/reboot-required") else "no"))
 
+    def persist_settings(self, chat):
+        if not save_state(self.state_file, self.chats):
+            self.reply(chat, "Warning: settings could not be saved and will reset on restart.")
+
     def cmd_alert(self, chat, st, arg):
         parts = arg.split()
         sub = parts[0][:15] if parts else ""
@@ -500,6 +643,7 @@ class MonitorMixin:
                 return
             st.thr[m] = float(val)
             st.fired[m] = False
+            self.persist_settings(chat)
             self.reply(chat, f"Alert for {name} set; you will be notified when it is reached.")
             return
 
@@ -510,6 +654,7 @@ class MonitorMixin:
                 return
             st.thr[m] = -1.0
             st.fired[m] = False
+            self.persist_settings(chat)
             self.reply(chat, f"Alert for {name} turned off.")
             return
 
@@ -549,10 +694,12 @@ class MonitorMixin:
             mins = int(val)
             st.report_every = mins * 60
             st.report_next = now + st.report_every
+            self.persist_settings(chat)
             self.reply(chat, f"Health reports on: every {mins} minutes.")
             return
         if sub == "off":
             st.report_every = 0
+            self.persist_settings(chat)
             self.reply(chat, "Scheduled reports turned off.")
             return
         if sub == "now":
@@ -715,6 +862,7 @@ class MonitorMixin:
         """Handles a monitoring command. Returns False if `cmd` is not one of ours."""
         routes = {
             "/health": lambda: self.send_health(chat),
+            "/diagnose": lambda: self.send_diagnose(chat),
             "/mem": lambda: self.cmd_mem(chat),
             "/swap": lambda: self.cmd_swap(chat),
             "/disk": lambda: self.cmd_disk(chat),
