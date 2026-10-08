@@ -890,7 +890,7 @@ static void run_table_command(int64_t chat, const rct_cmd_def *def) {
 
     if (def->kind == 'f') {
         if (!read_file_capped(def->target, &body)) {
-            reply(chat, "Not available on this host: %s", def->target);
+            reply(chat, "/%s\nNot available on this host: %s", def->name, def->target);
             buf_free(&body);
             return;
         }
