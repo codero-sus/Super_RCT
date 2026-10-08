@@ -136,6 +136,28 @@ password and the same commands.
   if it is typed there, and the bot's replies.
 - Channel IDs must not overlap with `SUPER_RCT_CHAT_IDS`.
 
+## Build an executable
+
+Run the builder. With no arguments on a terminal it asks each question in turn:
+
+```sh
+python3 tools/builder.py
+```
+
+Or pass arguments to build without prompts:
+
+```sh
+python3 tools/builder.py --target c            # C binary, build/dist/super_rct
+python3 tools/builder.py --target py-zipapp    # Python archive, build/dist/super_rct.pyz
+python3 tools/builder.py --target installers   # Linux installers, build/dist/
+python3 tools/builder.py --list                # list the targets
+python3 tools/builder.py --help                # every option (--out, --name, --dry-run)
+```
+
+`--dry-run` shows the steps without building. The Nuitka target (`py-nuitka`)
+needs Nuitka and Python development headers. Run the builder from an environment
+that has Nuitka installed. Each target builds for the operating system it runs on.
+
 ## Install on your own Linux machine
 
 `build/installers/super_rct-linux` (C) and `build/installers/super_rct-linux.py`
