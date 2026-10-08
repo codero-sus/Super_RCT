@@ -11,6 +11,8 @@ Configuration (environment variables)
   SUPER_RCT_SESSION_SECONDS  Idle timeout for a login (default 3600)
   SUPER_RCT_IP_FILE          IP registry file (default super_rct_ips.txt)
   SUPER_RCT_API              API base URL (default https://api.telegram.org)
+  SUPER_RCT_DISCORD_TOKEN    Discord bot token (optional)
+  SUPER_RCT_DISCORD_CHANNEL_IDS  allowed Discord channel IDs (required with a Discord token)
   SUPER_RCT_WATCH_PATHS      comma-separated paths to watch (optional)
   SUPER_RCT_WATCH_MAX_AGE_HOURS  watched file is stale after N hours (default 24)
 """
@@ -19,6 +21,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -29,9 +32,10 @@ import urllib.parse
 import urllib.request
 
 from commands_table import COMMANDS
+from discord_transport import DEFAULT_DISCORD_API, Discord, DiscordError
 from monitor import CMD_TIMEOUT_S, MonitorMixin
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 DEFAULT_API = "https://api.telegram.org"
 DEFAULT_IP_FILE = "super_rct_ips.txt"
 DEFAULT_SESSION_S = 3600
@@ -51,6 +55,8 @@ MAX_URL = 512
 MAX_WATCH = 16
 DEFAULT_WATCH_MAX_H = 24
 MAX_WATCH_MAX_H = 8760
+DISCORD_POLL_S = 3
+DISCORD_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{30,128}")
 READ_MAX = 65536
 OUT_MAX = 3500  # body cap, well under Telegram's 4096 characters
 CHUNK_MAX = 3500
@@ -142,9 +148,28 @@ def load_config(env):
             raise ConfigError("bad chat id list in SUPER_RCT_CHAT_IDS")
         chats.append(value)
 
+    discord_token = env.get("SUPER_RCT_DISCORD_TOKEN", "")
+    discord_chats = []
+    if discord_token:
+        if not DISCORD_TOKEN_RE.fullmatch(discord_token):
+            raise ConfigError("SUPER_RCT_DISCORD_TOKEN is malformed")
+        raw_channels = env.get("SUPER_RCT_DISCORD_CHANNEL_IDS", "")
+        if not raw_channels.strip():
+            raise ConfigError("SUPER_RCT_DISCORD_CHANNEL_IDS is required with a Discord token")
+        for part in raw_channels.split(","):
+            value = parse_int(part)
+            if value is None or value <= 0 or len(chats) + len(discord_chats) >= MAX_CHATS:
+                raise ConfigError("bad channel id list in SUPER_RCT_DISCORD_CHANNEL_IDS")
+            discord_chats.append(value)
+        if set(chats) & set(discord_chats):
+            raise ConfigError("an ID appears in both SUPER_RCT_CHAT_IDS and SUPER_RCT_DISCORD_CHANNEL_IDS")
+
     api = env.get("SUPER_RCT_API", "") or DEFAULT_API
     if not (api.startswith("https://") or api.startswith("http://")):
         raise ConfigError("SUPER_RCT_API must start with https:// or http://")
+    discord_api = env.get("SUPER_RCT_DISCORD_API", "")
+    if discord_api and not (discord_api.startswith("https://") or discord_api.startswith("http://")):
+        raise ConfigError("SUPER_RCT_DISCORD_API must start with https:// or http://")
 
     ip_file = env.get("SUPER_RCT_IP_FILE", "") or DEFAULT_IP_FILE
 
@@ -172,6 +197,9 @@ def load_config(env):
         "chats": chats,
         "api": api.rstrip("/"),
         "ip_file": ip_file,
+        "discord_token": discord_token,
+        "discord_chats": discord_chats,
+        "discord_api": env.get("SUPER_RCT_DISCORD_API", "") or DEFAULT_DISCORD_API,
         "watch_paths": watch_paths,
         "watch_max_h": watch_max_h,
     }
@@ -196,10 +224,11 @@ class Telegram:
 
 class ChatState:
     __slots__ = ("chat", "session_until", "fails", "locked_until",
-                 "thr", "fired", "report_every", "report_next")
+                 "thr", "fired", "report_every", "report_next", "discord")
 
-    def __init__(self, chat):
+    def __init__(self, chat, discord=False):
         self.chat = chat
+        self.discord = discord  # True for a Discord channel, False for Telegram
         self.session_until = 0  # logged in while now < session_until
         self.fails = 0          # consecutive wrong passwords
         self.locked_until = 0   # refuses /auth while now < locked_until
@@ -282,6 +311,10 @@ class Bot(MonitorMixin):
         self.password = cfg["password"].encode()
         self.session_s = cfg["session_s"]
         self.chats = {c: ChatState(c) for c in cfg["chats"]}
+        self.chats.update({c: ChatState(c, discord=True) for c in cfg["discord_chats"]})
+        self.discord = (Discord(cfg["discord_token"], cfg["discord_api"])
+                        if cfg["discord_token"] else None)
+        self.next_discord_poll = 0
         self.registry = IpRegistry(cfg["ip_file"])
         self.offset = 0
         self.started = time.time()
@@ -290,6 +323,13 @@ class Bot(MonitorMixin):
     # -- transport -----------------------------------------------------------
 
     def reply(self, chat, text):
+        st = self.chats.get(chat)
+        if st is not None and st.discord:
+            try:
+                self.discord.send(chat, text)
+            except (DiscordError, OSError, ValueError) as err:
+                log(f"Discord send to channel {chat} failed: {err}")
+            return
         try:
             resp = self.tg.call("sendMessage", {"chat_id": chat, "text": text},
                                 SEND_TIMEOUT_S)
@@ -485,8 +525,10 @@ class Bot(MonitorMixin):
 
     def poll_once(self):
         try:
+            # With Discord enabled, keep the Telegram poll short so Discord is checked promptly.
+            timeout = 1 if self.discord else POLL_TIMEOUT_S
             resp = self.tg.call("getUpdates",
-                                {"timeout": POLL_TIMEOUT_S, "offset": self.offset},
+                                {"timeout": timeout, "offset": self.offset},
                                 HTTP_TIMEOUT_S)
         except (OSError, ValueError) as err:
             log(f"getUpdates failed ({err}); retrying in {RETRY_DELAY_S} s")
@@ -501,12 +543,27 @@ class Bot(MonitorMixin):
             if isinstance(update, dict):
                 self.handle_update(update)
 
+    def poll_discord(self):
+        for chat, st in list(self.chats.items()):
+            if not st.discord:
+                continue
+            try:
+                texts = self.discord.poll(chat)
+            except (DiscordError, OSError, ValueError) as err:
+                log(f"Discord poll of channel {chat} failed: {err}")
+                continue
+            for text in texts:
+                self.handle_message(chat, text)
+
     def run(self):
         log(f"Super_RCT {VERSION} started ({len(self.chats)} allowed chat(s), "
             f"{len(self.registry.entries)} IP entries)")
         try:
             while True:
                 self.poll_once()
+                if self.discord and time.time() >= self.next_discord_poll:
+                    self.next_discord_poll = time.time() + DISCORD_POLL_S
+                    self.poll_discord()
                 self.monitor_tick(int(time.time()))
         except Stop:
             pass
