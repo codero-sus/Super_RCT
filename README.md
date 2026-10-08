@@ -102,7 +102,7 @@ secrets manager, not in a committed file.
   quoted `text` inside a reply cannot be executed as a command.
 - **Resilient**: API errors are logged and retried every 5 seconds. Ctrl-C or
   SIGTERM stops the bot cleanly.
-- **Non-blocking mistakes**: a failed login is counted per chat, so one chat's
+- **Per-chat limits**: failed logins are counted per chat, so one chat's
   typos cannot lock out another.
 
 ## Layout
