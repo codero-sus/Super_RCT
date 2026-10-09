@@ -471,6 +471,66 @@ class BotCases:
         self.assertEqual(texts[1], "hi")
         self.assertEqual(tg.sent, [])  # Discord replies never go to Telegram
 
+    NEW_SAMPLE = ["sys_vm_dirty_bytes", "uname_release", "uname_kernel_name", "time_date_rfc",
+                  "proc_ps_cpu_top", "disk_df_types", "net_ip_brief_addr", "systemd_boot_time",
+                  "systemd_failed", "log_dmesg_err"]
+
+    def assert_command_replies(self, replies, names):
+        self.assertEqual(len(replies), len(names), replies)
+        for reply, name in zip(replies, names):
+            with self.subTest(command=name):
+                self.assertTrue(reply.startswith(f"/{name}\n"), reply[:80])
+                self.assertNotIn("Unknown command", reply)
+
+    def test_new_commands_telegram(self):
+        names = self.NEW_SAMPLE
+        batch = [make_update(1, ALLOWED_CHAT, AUTH)]
+        batch += [make_update(i + 2, ALLOWED_CHAT, "/" + n) for i, n in enumerate(names)]
+        replies = self.run_bot([batch], expect_replies=len(names) + 1, timeout=60, settle=0.5)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assert_command_replies(replies[1:], names)
+
+    def test_new_commands_discord(self):
+        names = self.NEW_SAMPLE[:6]
+        tmp = tempfile.mkdtemp()
+        dc = MockDiscord({DISCORD_CHANNEL: []})
+        with MockTelegram([]) as tg, dc:
+            env = base_env(SUPER_RCT_API=tg.url,
+                           SUPER_RCT_IP_FILE=os.path.join(tmp, "ips.txt"),
+                           SUPER_RCT_STATE_FILE=os.path.join(tmp, "state.txt"),
+                           SUPER_RCT_DISCORD_TOKEN=DISCORD_TOKEN,
+                           SUPER_RCT_DISCORD_CHANNEL_IDS=str(DISCORD_CHANNEL),
+                           SUPER_RCT_DISCORD_API=dc.url + "/api/v10")
+            proc = subprocess.Popen(self.command, env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+            time.sleep(1.5)  # the first poll only records the newest message
+            dc.add(DISCORD_CHANNEL, {"id": "101", "content": AUTH, "author": {"bot": False}})
+            for i, name in enumerate(names):
+                dc.add(DISCORD_CHANNEL, {"id": str(102 + i), "content": "/" + name,
+                                         "author": {"bot": False}})
+            deadline = time.time() + 60
+            while time.time() < deadline and len(dc.sent_texts()) < len(names) + 1:
+                time.sleep(0.1)
+            time.sleep(0.5)
+            proc.send_signal(signal.SIGTERM)
+            try:
+                _, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, err = proc.communicate()
+        texts = dc.sent_texts()
+        self.assertTrue(texts[0].startswith("Authenticated."), (texts, err))
+        # Long replies are split into several Discord messages, so look for each
+        # command's header in order instead of expecting one message per command.
+        pos = 1
+        for name in names:
+            with self.subTest(command=name):
+                while pos < len(texts) and not texts[pos].startswith(f"/{name}\n"):
+                    pos += 1
+                self.assertLess(pos, len(texts), (name, texts[1:3]))
+                self.assertNotIn("Unknown command", texts[pos])
+            pos += 1
+
     def test_discord_config_errors(self):
         cases = [
             ({"SUPER_RCT_DISCORD_TOKEN": "short"}, "SUPER_RCT_DISCORD_TOKEN"),
@@ -661,6 +721,30 @@ class PythonBotTests(BotCases, unittest.TestCase):
 
 
 class GeneratedTableTests(unittest.TestCase):
+    def test_every_file_and_program_command_gets_a_reply(self):
+        """Runs every f and c entry through the Python bot in-process: each must answer."""
+        sys.path.insert(0, os.path.join(ROOT, "src"))
+        import super_rct  # noqa: E402
+
+        tmp = tempfile.mkdtemp()
+        env = base_env(SUPER_RCT_IP_FILE=os.path.join(tmp, "ips.txt"),
+                       SUPER_RCT_STATE_FILE=os.path.join(tmp, "state.txt"))
+        bot = super_rct.Bot(super_rct.load_config(env))
+        replies = []
+        bot.reply = lambda chat, text: replies.append(text)
+        runnable = [c for c in COMMANDS if c[1] in ("f", "c")]
+        for name, kind, target, _desc in runnable:
+            bot.run_table(ALLOWED_CHAT, name, kind, target)
+        self.assertEqual(len(replies), len(runnable))
+        for reply, (name, _kind, _target, _desc) in zip(replies, runnable):
+            with self.subTest(command=name):
+                self.assertTrue(reply.startswith(f"/{name}\n"), reply[:80])
+                self.assertTrue(reply.split("\n", 1)[1].strip(), "empty reply")
+
+    def test_table_has_at_least_570_entries(self):
+        # 270 entries before this change, plus at least 300 new ones.
+        self.assertGreaterEqual(len(COMMANDS), 570)
+
     def test_generated_tables_are_current(self):
         res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_commands.py"),
                               "--check"], capture_output=True, text=True)
