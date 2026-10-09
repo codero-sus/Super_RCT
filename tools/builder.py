@@ -153,29 +153,39 @@ def describe(step):
     return step.text
 
 
-def execute(plan):
+def run_command(argv, cwd, emit):
+    """Runs a command, sending each output line to `emit`. Returns its exit code."""
+    with subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                          errors="replace") as proc:
+        for line in proc.stdout:
+            emit(line.rstrip("\n"))
+        return proc.wait()
+
+
+def execute(plan, emit=print):
+    """Runs the steps for `plan`. Every line of progress and output goes to `emit`."""
     steps = build_steps(plan)
     for note in plan.notes:
-        print(f"note: {note}")
+        emit(f"note: {note}")
     if plan.dry_run:
-        print("Dry run. These steps would run:")
+        emit("Dry run. These steps would run:")
         for step in steps:
-            print(f"  - {describe(step)}")
+            emit(f"  - {describe(step)}")
         return 0
     for number, step in enumerate(steps, 1):
-        print(f"[{number}/{len(steps)}] {step.text}")
+        emit(f"[{number}/{len(steps)}] {step.text}")
         try:
             if isinstance(step.run, tuple):
                 argv, cwd = step.run
-                result = subprocess.run(argv, cwd=cwd, check=False)
-                if result.returncode != 0:
-                    raise BuildError(f"command failed with exit code {result.returncode}: "
-                                     + " ".join(argv))
+                code = run_command(argv, cwd, emit)
+                if code != 0:
+                    raise BuildError(f"command failed with exit code {code}: " + " ".join(argv))
             else:
                 step.run(plan)
         except OSError as err:
             raise BuildError(f"{step.text}: {err}") from None
-    print(f"Done. Output is in {plan.out_dir}")
+    emit(f"Done. Output is in {plan.out_dir}")
     return 0
 
 
