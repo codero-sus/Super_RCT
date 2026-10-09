@@ -154,6 +154,10 @@ python3 tools/builder.py --list                # list the targets
 python3 tools/builder.py --help                # every option (--out, --name, --dry-run)
 ```
 
+For a window instead of a terminal, run `python3 tools/gui_builder.py`. It uses
+tkinter, which comes with Python on Windows and macOS. On Linux install it first,
+for example with `sudo apt install python3-tk`.
+
 `--dry-run` shows the steps without building. The Nuitka target (`py-nuitka`)
 needs Nuitka and Python development headers. Run the builder from an environment
 that has Nuitka installed. Each target builds for the operating system it runs on.

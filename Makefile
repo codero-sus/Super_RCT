@@ -34,6 +34,7 @@ test: all
 	python3 tests/test_super_rct.py
 	python3 tests/test_installers.py
 	python3 tests/test_builder.py
+	python3 tests/test_gui_builder.py
 
 gen:
 	python3 tools/gen_commands.py
