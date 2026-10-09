@@ -24,7 +24,7 @@ password login before running any command.
 | `/ip disable <ip>` | Mark an IPv4/IPv6 address as disabled |
 | `/commands` | List every command with a one-line description |
 
-### Read-only system commands (235)
+### Read-only system commands (751)
 
 After `/auth`, these commands return live information from the host. Each one
 is either a fixed file read or a fixed program with fixed arguments. None
@@ -38,6 +38,10 @@ accepts user input, and none runs through a shell.
 | Network | `/ip_addr`, `/ip_route`, `/ss_listen`, `/ss_established`, `/net_tcp`, `/net_dev` |
 | Processes and services | `/ps`, `/ps_mem`, `/top`, `/systemd_running`, `/systemd_failed`, `/journal_errors` |
 | Users, time, identity | `/date`, `/uptime`, `/who`, `/whoami`, `/os_release`, `/machine_id`, `/timezone` |
+
+Most of the commands in the `sys_*` group read kernel tunables under `/proc/sys`
+(386 of them). Commands for files or programs that a host does not have answer
+"Not available on this host" instead of failing.
 
 Every command is defined in `src/commands.def`. The C and Python tables are
 generated from that file (`make gen`). The test suite fails if they are stale.
