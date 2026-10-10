@@ -3,6 +3,7 @@
 #                          make size       (show binary size)
 #                          make gen        (regenerate command tables)
 #                          make check-gen  (fail if command tables are stale)
+#                          make update     (show what a git pull would change)
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -g
 CFLAGS  += -Wall -Wextra -Wpedantic -Wshadow -Wformat=2
@@ -16,7 +17,7 @@ DEPS    := $(wildcard src/*.h)
 RELFLAGS := -Os -s -ffunction-sections -fdata-sections
 RELLDFLAGS := -Wl,--gc-sections
 
-.PHONY: all release test size gen check-gen clean
+.PHONY: all release test size gen check-gen update clean
 
 all: $(TARGET)
 
@@ -35,9 +36,13 @@ test: all
 	python3 tests/test_installers.py
 	python3 tests/test_builder.py
 	python3 tests/test_gui_builder.py
+	python3 tests/test_update.py
 
 gen:
 	python3 tools/gen_commands.py
+
+update:
+	python3 tools/update.py
 
 check-gen:
 	python3 tools/gen_commands.py --check
