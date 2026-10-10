@@ -4,6 +4,9 @@
     python3 tools/update.py            # check only: fetch and list what would change
     python3 tools/update.py --apply    # fast-forward to the upstream branch
 
+The source is always origin/<current branch>, so the checkout follows the branch
+it is on, whatever upstream git has configured.
+
 Safety rules:
   * Only a fast-forward is applied. Local commits (diverged history) are refused.
   * A tree with uncommitted changes to tracked files is refused.
@@ -29,19 +32,25 @@ def git(root, *args, check=True):
     return res
 
 
-def upstream(root):
-    res = git(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False)
+def source(root):
+    """Fetch origin/<current branch> and return (branch, remote ref)."""
+    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if branch == "HEAD":
+        raise UpdateError("the checkout is in detached HEAD state; check out the branch first.")
+    res = git(root, "fetch", "--quiet", "origin", branch, check=False)
     if res.returncode != 0:
-        raise UpdateError("the current branch has no upstream; run: "
-                          "git branch --set-upstream-to=origin/<branch>")
-    return res.stdout.strip()
+        if "couldn't find remote ref" in res.stderr:
+            raise UpdateError(f"origin has no branch '{branch}'.")
+        raise UpdateError(f"could not fetch origin/{branch}: {res.stderr.strip() or 'fetch failed'}")
+    ref = f"origin/{branch}"
+    if git(root, "rev-parse", "--verify", "--quiet", ref, check=False).returncode != 0:
+        raise UpdateError(f"origin has no branch '{branch}'.")
+    return branch, ref
 
 
 def status(root):
     """Fetch the upstream and describe the difference. Changes nothing locally."""
-    up = upstream(root)
-    git(root, "fetch", "--quiet")
-    branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    branch, up = source(root)
     behind = int(git(root, "rev-list", "--count", f"HEAD..{up}").stdout.strip())
     ahead = int(git(root, "rev-list", "--count", f"{up}..HEAD").stdout.strip())
     dirty = git(root, "status", "--porcelain", "--untracked-files=no").stdout.strip()
@@ -49,13 +58,13 @@ def status(root):
     if behind:
         out = git(root, "diff", "--name-status", f"HEAD..{up}").stdout
         changed = [line for line in out.splitlines() if line.strip()]
-    return {"branch": branch, "upstream": up, "behind": behind, "ahead": ahead,
+    return {"branch": branch, "source": up, "behind": behind, "ahead": ahead,
             "dirty": dirty, "changed": changed}
 
 
 def report(info):
     lines = [f"branch:   {info['branch']}",
-             f"upstream: {info['upstream']}",
+             f"source:   {info['source']}",
              f"behind:   {info['behind']} commit(s)",
              f"ahead:    {info['ahead']} commit(s)"]
     if info["changed"]:
@@ -70,20 +79,20 @@ def apply(root):
     info = status(root)
     print(report(info))
     if info["ahead"]:
-        raise UpdateError("this checkout has local commits that are not on the upstream; "
+        raise UpdateError(f"this checkout has local commits that are not on {info['source']}; "
                           "nothing was changed. Push or rebase them first.")
     if info["dirty"]:
         raise UpdateError("tracked files have uncommitted changes; nothing was changed. "
                           "Commit or stash them, then run the update again.")
     if not info["behind"]:
         return "Already up to date."
-    git(root, "merge", "--ff-only", info["upstream"])
+    git(root, "merge", "--ff-only", info["source"])
     check = subprocess.run([sys.executable, os.path.join(root, "tools", "gen_commands.py"), "--check"],
                            capture_output=True, text=True)
     note = check.stdout.strip() or check.stderr.strip()
     if check.returncode != 0:
         note += "\nThe generated command tables are stale. Run: python3 tools/gen_commands.py"
-    return f"Updated to {info['upstream']}.\n{note}".rstrip()
+    return f"Updated to {info['source']}.\n{note}".rstrip()
 
 
 def main(argv=None, root=ROOT):
