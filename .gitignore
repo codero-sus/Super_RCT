@@ -2,3 +2,5 @@ build/
 super_rct_ips.txt
 *.tmp
 __pycache__/
+
+python.env
