@@ -47,6 +47,7 @@ class UpdateTests(unittest.TestCase):
         git(self.work, "push", "-q", "origin", "main")
         git(self.tmp, "clone", "-q", self.remote, self.local)
         git(self.local, "checkout", "-q", "main")
+        git(self.local, "branch", "--unset-upstream")  # the source must not depend on upstream config
 
     def push_remote_change(self, text):
         write(os.path.join(self.work, "a.txt"), text)
@@ -103,11 +104,24 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(read(os.path.join(self.local, "secret.env")), "KEEP=1\n")
 
-    def test_no_upstream_is_explained(self):
-        git(self.local, "branch", "--unset-upstream")
+    def test_source_is_this_branch_even_with_other_upstream(self):
+        self.push_remote_change("two\n")
+        code, out, _ = self.run_update("--apply")
+        self.assertEqual(code, 0, out)
+        self.assertIn("source:   origin/main", out)
+        self.assertEqual(read(os.path.join(self.local, "a.txt")), "two\n")
+
+    def test_missing_remote_branch_is_explained(self):
+        git(self.local, "checkout", "-q", "-b", "feature-only")
         code, _, err = self.run_update()
         self.assertEqual(code, 1)
-        self.assertIn("no upstream", err)
+        self.assertIn("origin has no branch 'feature-only'", err)
+
+    def test_detached_head_is_refused(self):
+        git(self.local, "checkout", "-q", "--detach")
+        code, _, err = self.run_update("--apply")
+        self.assertEqual(code, 1)
+        self.assertIn("detached HEAD", err)
 
 
 if __name__ == "__main__":
