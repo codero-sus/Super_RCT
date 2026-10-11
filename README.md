@@ -242,3 +242,12 @@ src/commands.def       command table (source); generates commands_table.h/.py
 Makefile               build, release, test, size, gen, check-gen
 tests/test_super_rct.py integration tests (both variants) against a mock Telegram API
 ```
+
+## Author and credits
+
+Super_RCT is made by **codero-sus**.
+
+- GitHub: [github.com/codero-sus](https://github.com/codero-sus)
+- Website: [the-codero.web.app](https://the-codero.web.app/)
+
+Made with ❤️ by codero-sus
