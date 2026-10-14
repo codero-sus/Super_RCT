@@ -17,7 +17,7 @@ DEPS    := $(wildcard src/*.h)
 RELFLAGS := -Os -s -ffunction-sections -fdata-sections
 RELLDFLAGS := -Wl,--gc-sections
 
-.PHONY: all release test size gen check-gen update clean
+.PHONY: all release test test-bot-c test-bot-py test-bot-table test-installers test-builders test-update size gen check-gen update clean
 
 all: $(TARGET)
 
@@ -31,11 +31,29 @@ release: $(SRC) $(DEPS) | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
+# The bot suite is the slow part. Its two variants and the rest run in parallel
+# (make -j); -O keeps each target's output together.
+TEST_JOBS ?= 4
 test: all
-	python3 tests/test_super_rct.py
+	$(MAKE) -j$(TEST_JOBS) -O test-bot-c test-bot-py test-bot-table test-installers test-builders test-update
+
+test-bot-c: all
+	python3 tests/test_super_rct.py CBotTests
+
+test-bot-py: all
+	python3 tests/test_super_rct.py PythonBotTests
+
+test-bot-table: all
+	python3 tests/test_super_rct.py GeneratedTableTests
+
+test-installers: all
 	python3 tests/test_installers.py
+
+test-builders: all
 	python3 tests/test_builder.py
 	python3 tests/test_gui_builder.py
+
+test-update: all
 	python3 tests/test_update.py
 
 gen:
