@@ -9,6 +9,8 @@ version. Standard library only.
 
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
 import time
@@ -16,6 +18,10 @@ import time
 from commands_table import COMMANDS
 
 CMD_TIMEOUT_S = 5                  # per external program, matches the C variant
+SHELL_TIMEOUT_S = 60               # /run: one shell command, matches the C variant
+SHELL_MAX_CMD = 1000              # bytes in the command text
+SHELL_READ_MAX = 65536            # bytes kept from /run output; the rest is drained
+OUT_MAX_BODY = 3500               # characters of /run output sent to chat
 METRIC_NAMES = ("mem", "disk", "temp", "load")
 MEM, DISK, TEMP, LOAD = range(4)
 HYSTERESIS = (5.0, 5.0, 5.0, 0.2)  # recovery margin per metric
@@ -252,6 +258,52 @@ def run_argv(argv):
         return 124, err.stdout or b""
 
 
+def run_shell(cmd, timeout):
+    """Runs `cmd` with /bin/sh -c in its own process group, for /run.
+
+    Returns (status, output bytes). Status 124 means the command was killed
+    after `timeout` seconds, including any background children it started.
+    Output is kept up to SHELL_READ_MAX bytes; the rest is read and dropped.
+    """
+    try:
+        proc = subprocess.Popen(["/bin/sh", "-c", cmd], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError:
+        return 127, b""
+    out = bytearray()
+    deadline = time.monotonic() + timeout
+    eof = False
+    killed = False
+    fd = proc.stdout.fileno()
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            killed = True
+            break
+        ready, _, _ = select.select([fd], [], [], min(left, 0.5)) if not eof else ([], [], [])
+        if ready:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                eof = True
+            elif len(out) < SHELL_READ_MAX:
+                out += chunk[:SHELL_READ_MAX - len(out)]
+        if eof and proc.poll() is not None:
+            break
+        if eof:
+            time.sleep(0.05)
+    if killed:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        proc.stdout.close()
+        return 124, bytes(out)
+    proc.stdout.close()
+    return proc.returncode, bytes(out)
+
+
 def _text(data):
     return data.decode("utf-8", "replace")
 
@@ -359,6 +411,7 @@ class MonitorMixin:
         self.reminders = [None] * MAX_REMINDERS  # slot -> dict or None
         self.next_rem_id = 1
         self.next_eval = 0
+        self.shell_enabled = cfg.get("shell", True)
 
     # -- metrics and alerts --------------------------------------------------
 
@@ -850,6 +903,34 @@ class MonitorMixin:
                          f"Uptime: {fmt_duration(now - int(self.started))}\n"
                          f"Commands: {len(COMMANDS)}")
 
+    def cmd_run(self, chat, arg):
+        """/run <command>: runs the command through /bin/sh on this host."""
+        if not self.shell_enabled:
+            self.reply(chat, "/run is disabled on this host (SUPER_RCT_SHELL=0).")
+            return
+        cmd = arg.strip()
+        if not cmd:
+            self.reply(chat, "Usage: /run <command>  (runs through /bin/sh on this host)")
+            return
+        if len(cmd.encode("utf-8")) > SHELL_MAX_CMD:
+            self.reply(chat, f"Command is too long (max {SHELL_MAX_CMD} bytes).")
+            return
+        status, data = run_shell(cmd, SHELL_TIMEOUT_S)
+        # Audit line: who ran what and the result. Output is not logged.
+        print(f"[{fmt_clock(time.time())}] run chat={chat} status={status} cmd={cmd!r}",
+              file=sys.stderr, flush=True)
+        body = _text(data).rstrip()
+        if len(body) > OUT_MAX_BODY:
+            body = body[:OUT_MAX_BODY] + "\n... (truncated)"
+        note = ""
+        if status == 124:
+            note = f"\n(timed out after {SHELL_TIMEOUT_S} s)"
+        elif status == 127:
+            note = "\n(could not run /bin/sh)"
+        elif status != 0:
+            note = f"\n(exit {status})"
+        self.reply(chat, "/run\n" + (body or "(no output)") + note)
+
     def cmd_echo(self, chat, arg):
         if not arg:
             self.reply(chat, "Usage: /echo <text>")
@@ -862,6 +943,7 @@ class MonitorMixin:
         """Handles a monitoring command. Returns False if `cmd` is not one of ours."""
         routes = {
             "/health": lambda: self.send_health(chat),
+            "/run": lambda: self.cmd_run(chat, arg),
             "/diagnose": lambda: self.send_diagnose(chat),
             "/mem": lambda: self.cmd_mem(chat),
             "/swap": lambda: self.cmd_swap(chat),

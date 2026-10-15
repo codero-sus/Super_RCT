@@ -16,7 +16,7 @@
  *     bot token and password never appear in the process list.
  *   - JSON is parsed with a small depth-aware reader that only understands
  *     the subset of fields the bot needs.
- *   - No arbitrary shell execution is offered, by design.
+ *   - /run runs a shell command for an authenticated chat. SUPER_RCT_SHELL=0 turns it off.
  *
  * Configuration (environment variables)
  *   SUPER_RCT_TOKEN            Telegram bot token (required)
@@ -26,6 +26,7 @@
  *   SUPER_RCT_IP_FILE          IP registry file (default: super_rct_ips.txt)
  *   SUPER_RCT_STATE_FILE      saved alert and report settings (default: super_rct_state.txt)
  *   SUPER_RCT_API              API base URL (default: https://api.telegram.org)
+ *   SUPER_RCT_SHELL            1 (default) allows /run; 0 turns it off
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -35,6 +36,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -95,6 +97,7 @@ typedef struct {
 } chat_state;
 
 static volatile sig_atomic_t g_stop = 0;
+static int g_shell_enabled = 1; /* SUPER_RCT_SHELL: 1 = /run allowed */
 static time_t g_started;
 static char g_token[MAX_TOKEN];
 static char g_password[MAX_PASSWORD + 1];
@@ -736,6 +739,8 @@ static void split_command(const char *text, char *cmd, size_t cn, char *arg, siz
 /* ------------------------------------------------------------------------- */
 
 #define CMD_TIMEOUT_S 5
+#define SHELL_TIMEOUT_S 60 /* /run: one shell command */
+#define SHELL_MAX_CMD 1000 /* bytes in the command text */
 #define READ_MAX 65536
 #define OUT_MAX 3500 /* body cap, well under Telegram's 4096 characters */
 #define CHUNK_MAX 3500
@@ -850,6 +855,117 @@ static int run_argv(const char *target, buf_t *out) {
     if (!split_argv(target, store, sizeof store, argv, 16))
         return -1;
     return run_argv_vec(argv, out);
+}
+
+static double mono_seconds(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/*
+ * Runs `cmd` with /bin/sh -c in its own process group (for /run). Output is kept up
+ * to READ_MAX bytes and the rest is drained. If the command, or a background child
+ * that still holds the output pipe, outlives `timeout_s`, the whole group is killed
+ * and EXIT_TIMEOUT is returned. Returns -1 on a local error.
+ */
+static int run_shell_cmd(const char *cmd, int timeout_s, buf_t *out) {
+    int pfd[2];
+    pid_t pid;
+    int status = 0;
+    int exited = 0, eof = 0, killed = 0;
+    double deadline;
+    char chunk[4096];
+
+    if (pipe(pfd) < 0)
+        return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        int nul = open("/dev/null", O_RDONLY);
+
+        if (nul >= 0) {
+            dup2(nul, STDIN_FILENO);
+            close(nul);
+        }
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[0]);
+        close(pfd[1]);
+        setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(EXIT_NOT_FOUND);
+    }
+    setpgid(pid, pid); /* also in the parent, so the group exists before any kill */
+    close(pfd[1]);
+
+    deadline = mono_seconds() + timeout_s;
+    while (!(eof && exited)) {
+        struct pollfd pf;
+        double left = deadline - mono_seconds();
+        int wait_ms;
+
+        if (!exited && waitpid(pid, &status, WNOHANG) == pid)
+            exited = 1;
+        if (left <= 0 || g_stop) {
+            kill(-pid, SIGKILL);
+            killed = 1;
+            break;
+        }
+        if (eof) { /* output closed, waiting for the child to exit */
+            struct timespec nap = {0, 50000000};
+
+            nanosleep(&nap, NULL);
+            continue;
+        }
+        pf.fd = pfd[0];
+        pf.events = POLLIN;
+        pf.revents = 0;
+        wait_ms = (int)(left * 1000.0);
+        if (wait_ms > 200)
+            wait_ms = 200;
+        if (wait_ms < 1)
+            wait_ms = 1;
+        if (poll(&pf, 1, wait_ms) < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
+            ssize_t r = read(pfd[0], chunk, sizeof chunk);
+
+            if (r < 0 && errno == EINTR)
+                continue;
+            if (r <= 0) {
+                eof = 1;
+            } else if (out->len < READ_MAX) {
+                size_t take = (size_t)r;
+
+                if (take > READ_MAX - out->len)
+                    take = READ_MAX - out->len;
+                buf_add(out, chunk, take);
+            }
+        }
+    }
+    close(pfd[0]);
+    if (!exited) {
+        if (!killed) {
+            kill(-pid, SIGKILL); /* poll failed; do not leave the child behind */
+            killed = 1;
+        }
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+    }
+    if (killed)
+        return EXIT_TIMEOUT;
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return -1;
 }
 
 /* Reads at most READ_MAX bytes of a fixed file. Returns false if unreadable. */
@@ -1159,6 +1275,19 @@ static bool load_config(void) {
         return false;
     }
     strcpy(g_token, tok);
+
+    {
+        const char *sh = getenv("SUPER_RCT_SHELL");
+
+        if (sh && *sh) {
+            if (strcmp(sh, "0") == 0)
+                g_shell_enabled = 0;
+            else if (strcmp(sh, "1") != 0) {
+                fprintf(stderr, "error: SUPER_RCT_SHELL must be 0 or 1 (default 1)\n");
+                return false;
+            }
+        }
+    }
 
     if (!pw || strlen(pw) < MIN_PASSWORD || strlen(pw) > MAX_PASSWORD) {
         fprintf(stderr, "error: SUPER_RCT_PASSWORD is required (%d-%d bytes)\n",

@@ -176,6 +176,10 @@ def load_config(env):
 
     ip_file = env.get("SUPER_RCT_IP_FILE", "") or DEFAULT_IP_FILE
 
+    shell_raw = env.get("SUPER_RCT_SHELL", "")
+    if shell_raw not in ("", "0", "1"):
+        raise ConfigError("SUPER_RCT_SHELL must be 0 or 1 (default 1)")
+
     watch_paths = []
     for part in env.get("SUPER_RCT_WATCH_PATHS", "").split(","):
         part = part.strip(" ")
@@ -206,6 +210,7 @@ def load_config(env):
         "discord_api": env.get("SUPER_RCT_DISCORD_API", "") or DEFAULT_DISCORD_API,
         "watch_paths": watch_paths,
         "watch_max_h": watch_max_h,
+        "shell": shell_raw != "0",
     }
 
 

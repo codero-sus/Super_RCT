@@ -1401,6 +1401,78 @@ static void cmd_about(int64_t chat, time_t now) {
           SRCT_VERSION, dur, RCT_NCOMMANDS);
 }
 
+/* /run <command>: runs the command through /bin/sh on this host (SUPER_RCT_SHELL). */
+static void cmd_run(int64_t chat, const char *arg) {
+    const char *p = arg;
+    size_t n, cut;
+    char *cmd;
+    buf_t body = {0}, msg = {0};
+    char note[96] = "";
+    int status;
+
+    if (!g_shell_enabled) {
+        reply(chat, "/run is disabled on this host (SUPER_RCT_SHELL=0).");
+        return;
+    }
+    while (*p == ' ' || *p == '\t')
+        p++;
+    n = strlen(p);
+    while (n > 0 && (p[n - 1] == ' ' || p[n - 1] == '\t'))
+        n--;
+    if (n == 0) {
+        reply(chat, "Usage: /run <command>  (runs through /bin/sh on this host)");
+        return;
+    }
+    if (n > SHELL_MAX_CMD) {
+        reply(chat, "Command is too long (max %d bytes).", SHELL_MAX_CMD);
+        return;
+    }
+    cmd = malloc(n + 1);
+    if (!cmd) {
+        reply(chat, "Out of memory.");
+        return;
+    }
+    memcpy(cmd, p, n);
+    cmd[n] = '\0';
+
+    status = run_shell_cmd(cmd, SHELL_TIMEOUT_S, &body);
+    /* Audit line: who ran what and the result. Output is not logged. */
+    logf_("run chat=%" PRId64 " status=%d cmd=\"%s\"", chat, status, cmd);
+    free(cmd);
+
+    if (status < 0) {
+        reply(chat, "Could not run /run");
+        buf_free(&body);
+        return;
+    }
+    if (status == EXIT_TIMEOUT)
+        snprintf(note, sizeof note, "\n(timed out after %d s)", SHELL_TIMEOUT_S);
+    else if (status == EXIT_NOT_FOUND)
+        snprintf(note, sizeof note, "\n(could not run /bin/sh)");
+    else if (status > 0)
+        snprintf(note, sizeof note, "\n(exit %d)", status);
+
+    n = body.len;
+    while (n > 0 && (body.data[n - 1] == '\n' || body.data[n - 1] == '\r' ||
+                     body.data[n - 1] == ' ' || body.data[n - 1] == '\t'))
+        n--;
+    body.len = n;
+
+    buf_add(&msg, "/run\n", 5);
+    if (body.len == 0) {
+        buf_add(&msg, "(no output)", 11);
+    } else {
+        cut = utf8_cut(body.data, body.len, OUT_MAX);
+        buf_add(&msg, body.data, cut);
+        if (cut < body.len)
+            buf_add(&msg, "\n... (truncated)", 16);
+    }
+    buf_add(&msg, note, strlen(note));
+    send_text(chat, msg.data);
+    buf_free(&body);
+    buf_free(&msg);
+}
+
 static void cmd_echo(int64_t chat, const char *arg) {
     if (arg[0] == '\0')
         reply(chat, "Usage: /echo <text>");
@@ -1460,6 +1532,8 @@ static bool monitor_dispatch(int64_t chat, chat_state *c, const char *cmd, const
         cmd_watch(chat, true, now);
     else if (strcmp(cmd, "/notify") == 0)
         cmd_notify(chat, arg);
+    else if (strcmp(cmd, "/run") == 0)
+        cmd_run(chat, arg);
     else if (strcmp(cmd, "/echo") == 0)
         cmd_echo(chat, arg);
     else if (strcmp(cmd, "/botstats") == 0)
