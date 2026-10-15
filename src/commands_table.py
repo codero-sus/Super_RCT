@@ -266,6 +266,7 @@ COMMANDS = (
     ('watch_check', 'b', '', 'Report stale watched files now'),
     ('notify', 'b', '', 'Desktop notification on the host'),
     ('echo', 'b', '', 'Echo your text back'),
+    ('run', 'b', '', 'Run a shell command on this host: /run <command>'),
     ('botstats', 'b', '', 'Bot counters: uptime, commands, auth failures'),
     ('sessions', 'b', '', 'Logged-in chats and session expiry'),
     ('logout_all', 'b', '', 'End every session'),

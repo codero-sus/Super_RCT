@@ -548,6 +548,37 @@ class BotCases:
                 self.assertEqual(res.returncode, 2, res.stderr)
                 self.assertIn(needle, res.stderr)
 
+    # -- /run (shell command, behind /auth) ------------------------------------
+
+    def test_run_executes_shell_command(self):
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, "/run echo before-auth"),
+            make_update(2, ALLOWED_CHAT, AUTH),
+            make_update(3, ALLOWED_CHAT, "/run echo hi-there; echo second-line; exit 3"),
+        ]], expect_replies=3)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertEqual(len(replies), 3, replies)
+        self.assertFalse(replies[0].startswith("/run\n"), replies[0])  # refused before /auth
+        run_reply = replies[2]
+        self.assertTrue(run_reply.startswith("/run\n"), run_reply)
+        self.assertIn("hi-there\nsecond-line", run_reply)
+        self.assertIn("(exit 3)", run_reply)
+
+    def test_run_can_be_turned_off(self):
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/run echo should-not-run"),
+        ]], expect_replies=2, SUPER_RCT_SHELL="0")
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertIn("disabled", replies[1])
+        self.assertNotIn("should-not-run", replies[1])
+
+    def test_shell_setting_must_be_0_or_1(self):
+        res = subprocess.run(self.command, env=base_env(SUPER_RCT_SHELL="maybe"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("SUPER_RCT_SHELL", res.stderr)
+
     # -- monitoring and utilities (all behind /auth) -------------------------
 
     def test_settings_survive_restart(self):
@@ -740,6 +771,16 @@ class GeneratedTableTests(unittest.TestCase):
             with self.subTest(command=name):
                 self.assertTrue(reply.startswith(f"/{name}\n"), reply[:80])
                 self.assertTrue(reply.split("\n", 1)[1].strip(), "empty reply")
+
+    def test_run_shell_kills_background_children_on_timeout(self):
+        """A background child that keeps the output pipe open must not hang /run."""
+        import monitor  # noqa: E402  (src is on sys.path)
+
+        started = time.monotonic()
+        status, out = monitor.run_shell("echo started; sleep 30 & sleep 30", 1)
+        self.assertEqual(status, 124)
+        self.assertIn(b"started", out)
+        self.assertLess(time.monotonic() - started, 10)
 
     def test_table_has_at_least_570_entries(self):
         # 270 entries before this change, plus at least 300 new ones.

@@ -25,7 +25,7 @@ BUILTINS = {
     "uptime_h", "failed_units", "updates_count", "reboot_required", "alert",
     "report", "remind", "timers", "timer_cancel", "watch", "watch_check",
     "notify", "echo", "botstats", "sessions", "logout_all", "about", "selftest",
-    "config",
+    "config", "run",
 }
 KINDS = {"f", "c", "b"}
 
