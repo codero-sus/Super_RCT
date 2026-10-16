@@ -548,6 +548,49 @@ class BotCases:
                 self.assertEqual(res.returncode, 2, res.stderr)
                 self.assertIn(needle, res.stderr)
 
+    # -- alert cooldown and quiet hours --------------------------------------
+
+    def test_alert_cooldown_and_quiet_hours_survive_restart(self):
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        first = [[make_update(1, ALLOWED_CHAT, AUTH),
+                  make_update(2, ALLOWED_CHAT, "/alert set mem 80"),
+                  make_update(3, ALLOWED_CHAT, "/alert cooldown 30"),
+                  make_update(4, ALLOWED_CHAT, "/alert quiet 22 7")]]
+        self.run_bot(first, expect_replies=5, SUPER_RCT_STATE_FILE=state)
+        second = [[make_update(1, ALLOWED_CHAT, AUTH),
+                   make_update(2, ALLOWED_CHAT, "/alert list")]]
+        replies = self.run_bot(second, expect_replies=2, SUPER_RCT_STATE_FILE=state)
+        text = "\n".join(replies)
+        self.assertIn("Cooldown between alerts: 30 min", text)
+        self.assertIn("Quiet hours (server time): 22:00 to 07:00", text)
+
+    def test_alert_cooldown_and_quiet_hours_are_validated(self):
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/alert cooldown 5000"),
+            make_update(3, ALLOWED_CHAT, "/alert quiet 5 5"),
+            make_update(4, ALLOWED_CHAT, "/alert quiet 25 3"),
+            make_update(5, ALLOWED_CHAT, "/alert quiet off"),
+        ]], expect_replies=5)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertIn("Usage: /alert cooldown", replies[1])
+        self.assertIn("Usage: /alert quiet", replies[2])
+        self.assertIn("Usage: /alert quiet", replies[3])
+        self.assertEqual(replies[4], "Quiet hours turned off.")
+
+    def test_six_field_state_lines_still_load(self):
+        """State files written before cooldowns existed (6 fields) keep working."""
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        with open(state, "w", encoding="utf-8") as f:
+            f.write(f"{ALLOWED_CHAT} 85.0 -1 -1 -1 0\n")
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, AUTH),
+                                 make_update(2, ALLOWED_CHAT, "/alert list")]],
+                               expect_replies=2, SUPER_RCT_STATE_FILE=state)
+        text = "\n".join(replies)
+        self.assertIn("mem: 85", text)
+        self.assertIn("Cooldown between alerts: off", text)
+        self.assertIn("Quiet hours: off", text)
+
     # -- /run (shell command, behind /auth) ------------------------------------
 
     def test_run_executes_shell_command(self):
@@ -645,11 +688,13 @@ class BotCases:
             ("/report on 5", "Health reports on: every 5 minutes."),
             ("/report off", "Scheduled reports turned off."),
             ("/alert list", "Alert limits (reply lists current settings):\n"
-                            "mem: off\ndisk: off\ntemp: off\nload: off\n"),
+                            "mem: off\ndisk: off\ntemp: off\nload: off\n"
+                            "Cooldown between alerts: off\nQuiet hours: off\n"),
             ("/alert set mem 200", "Value for mem is out of range."),
             ("/alert set mem 99", "Alert for mem set; you will be notified when it is reached."),
             ("/alert off mem", "Alert for mem turned off."),
-            ("/alert nope", "Usage: /alert list | set <metric> <value> | off <metric> | check"),
+            ("/alert nope", "Usage: /alert list | set <metric> <value> | off <metric> | check | "
+                            "cooldown <minutes> | quiet <start> <end> | quiet off"),
             ("/watch", "No watch paths configured (set SUPER_RCT_WATCH_PATHS)."),
             ("/sessions", "chat 42: logged in"),
             ("/config", "Allowed chats: 2"),
@@ -781,6 +826,44 @@ class GeneratedTableTests(unittest.TestCase):
         self.assertEqual(status, 124)
         self.assertIn(b"started", out)
         self.assertLess(time.monotonic() - started, 10)
+
+    def test_alert_cooldown_quiet_hours_and_recovery(self):
+        """Alert logic on the Python side: cooldown, quiet hours, recovery duration."""
+        import monitor  # noqa: E402  (src is on sys.path)
+        import super_rct  # noqa: E402
+
+        tmp = tempfile.mkdtemp()
+        env = base_env(SUPER_RCT_IP_FILE=os.path.join(tmp, "ips.txt"),
+                       SUPER_RCT_STATE_FILE=os.path.join(tmp, "state.txt"))
+        bot = super_rct.Bot(super_rct.load_config(env))
+        sent = []
+        bot.reply = lambda chat, text: sent.append(text)
+        st = bot.chats[ALLOWED_CHAT]
+        st.thr[monitor.MEM] = 80.0
+        st.cooldown_min = 10
+        t0 = time.mktime((2026, 1, 5, 12, 0, 0, 0, 0, -1))  # local noon, outside quiet hours
+        high, low = [90.0, None, None, None], [50.0, None, None, None]
+
+        bot.evaluate_alerts(high, t0)                   # ALERT
+        bot.evaluate_alerts(low, t0 + 60)               # RECOVERED after 1 minute
+        bot.evaluate_alerts(high, t0 + 120)             # inside cooldown: silent
+        bot.evaluate_alerts(low, t0 + 180)              # nothing was announced: silent
+        bot.evaluate_alerts(high, t0 + 900)             # cooldown over: ALERT again
+        self.assertEqual(len(sent), 3, sent)
+        self.assertTrue(sent[0].startswith("ALERT mem is"), sent[0])
+        self.assertIn("after 0d 0h 1m", sent[1])
+        self.assertTrue(sent[2].startswith("ALERT mem is"), sent[2])
+
+        # Quiet hours: 22:00 to 07:00 server time, no messages at 23:00.
+        st.cooldown_min = 0
+        st.quiet_start, st.quiet_end = 22, 7
+        st.fired[monitor.MEM] = False
+        st.notified[monitor.MEM] = False
+        before = len(sent)
+        night = time.mktime((2026, 1, 5, 23, 0, 0, 0, 0, -1))
+        bot.evaluate_alerts(high, night)
+        bot.evaluate_alerts(low, night + 60)
+        self.assertEqual(len(sent), before, sent)
 
     def test_table_has_at_least_570_entries(self):
         # 270 entries before this change, plus at least 300 new ones.
