@@ -37,6 +37,7 @@ REAL_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "vfat", "ex
                      "ntfs", "ntfs3", "zfs", "jfs"})
 
 _INT_RE = re.compile(r"[+-]?[0-9]+")
+_DAILY_RE = re.compile(r"([0-9]{1,2}):([0-9]{2})")
 _FLOAT_RE = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 _REMIND_RE = re.compile(r"[ \t]*([+-]?[0-9]+)")
 _MEMINFO_RE = re.compile(r"^(MemTotal|MemAvailable|SwapTotal|SwapFree):\s+([0-9]+)\s+kB",
@@ -339,11 +340,12 @@ def load_state(path, chats):
             chat = int(parts[0])
             thr = [float(x) for x in parts[1:5]]
             minutes = int(parts[5])
-            if len(parts) not in (6, 9):
+            if len(parts) not in (6, 9, 10):
                 raise ValueError("wrong field count")
-            # Lines written before cooldowns existed have 6 fields: defaults apply.
-            cooldown, qstart, qend = (0, -1, -1) if len(parts) == 6 else (
-                int(parts[6]), int(parts[7]), int(parts[8]))
+            # Older lines have 6 fields (no cooldown, quiet hours or daily report)
+            # or 9 fields (no daily report). Missing fields take their defaults.
+            extra = [int(x) for x in parts[6:]]
+            cooldown, qstart, qend, daily = (extra + [0, -1, -1, -1][len(extra):])[:4]
         except ValueError:
             print(f"warning: skipping bad line in {path}", file=sys.stderr)
             continue
@@ -355,6 +357,7 @@ def load_state(path, chats):
         ok = ok and 0 <= cooldown <= COOLDOWN_MAX_MIN
         ok = ok and (qstart == -1 and qend == -1 or
                      (0 <= qstart <= 23 and 0 <= qend <= 23 and qstart != qend))
+        ok = ok and (daily == -1 or 0 <= daily <= 1439)
         if not ok:
             print(f"warning: skipping out-of-range settings for chat {chat} in {path}",
                   file=sys.stderr)
@@ -365,6 +368,22 @@ def load_state(path, chats):
         st.cooldown_min = cooldown
         st.quiet_start = qstart
         st.quiet_end = qend
+        st.daily_at = daily
+        # Next report time: never "now", so a restart does not send a report at once.
+        if daily >= 0:
+            st.report_next = next_daily(time.time(), daily)
+        elif st.report_every:
+            st.report_next = int(time.time()) + st.report_every
+
+
+def next_daily(now, minute_of_day):
+    """The first local time after `now` that is `minute_of_day` minutes past midnight."""
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    nxt = midnight + minute_of_day * 60
+    while nxt <= now:
+        nxt += 86400
+    return nxt
 
 
 def in_quiet_hours(st, now):
@@ -378,8 +397,8 @@ def in_quiet_hours(st, now):
 
 
 def settings_extra(st):
-    """True when the cooldown or quiet hours differ from their defaults."""
-    return st.cooldown_min > 0 or st.quiet_start >= 0
+    """True when the cooldown, quiet hours or daily report differ from their defaults."""
+    return st.cooldown_min > 0 or st.quiet_start >= 0 or st.daily_at >= 0
 
 
 def save_state(path, chats):
@@ -389,7 +408,8 @@ def save_state(path, chats):
         if all(t < 0 for t in st.thr) and st.report_every <= 0 and not settings_extra(st):
             continue
         fields = ([str(chat)] + [repr(t) for t in st.thr] + [str(st.report_every // 60)]
-                  + [str(st.cooldown_min), str(st.quiet_start), str(st.quiet_end)])
+                  + [str(st.cooldown_min), str(st.quiet_start), str(st.quiet_end),
+                     str(st.daily_at)])
         lines.append(" ".join(fields))
     tmp = path + ".tmp"
     try:
@@ -600,8 +620,9 @@ class MonitorMixin:
             self.evaluate_alerts(self.collect_metrics(), now)
 
         for c in self.chats.values():
-            if c.report_every > 0 and now >= c.report_next:
-                c.report_next = now + c.report_every
+            if (c.report_every > 0 or c.daily_at >= 0) and now >= c.report_next:
+                c.report_next = (next_daily(now, c.daily_at) if c.daily_at >= 0
+                                 else now + c.report_every)
                 self.send_health(c.chat)
 
         for i, rem in enumerate(self.reminders):
@@ -818,7 +839,11 @@ class MonitorMixin:
         val = parts[1][:15] if len(parts) > 1 else ""
 
         if sub in ("", "status"):
-            if st.report_every <= 0:
+            if st.daily_at >= 0:
+                self.reply(chat, f"Daily health report at {st.daily_at // 60:02d}:"
+                                 f"{st.daily_at % 60:02d} (server time); next at "
+                                 f"{fmt_clock(st.report_next)}.")
+            elif st.report_every <= 0:
                 self.reply(chat, "Scheduled reports are off. Use /report on <minutes>.")
             else:
                 self.reply(chat, f"Health reports every {st.report_every // 60} minutes; "
@@ -832,18 +857,32 @@ class MonitorMixin:
             mins = int(val)
             st.report_every = mins * 60
             st.report_next = now + st.report_every
+            st.daily_at = -1
             self.persist_settings(chat)
             self.reply(chat, f"Health reports on: every {mins} minutes.")
             return
+        if sub == "daily":
+            m = _DAILY_RE.fullmatch(val)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                self.reply(chat, "Usage: /report daily <HH:MM>  (server time, 00:00-23:59)")
+                return
+            st.daily_at = int(m.group(1)) * 60 + int(m.group(2))
+            st.report_every = 0
+            st.report_next = next_daily(now, st.daily_at)
+            self.persist_settings(chat)
+            self.reply(chat, f"Daily health report at {m.group(1).zfill(2)}:{m.group(2)} "
+                             "(server time).")
+            return
         if sub == "off":
             st.report_every = 0
+            st.daily_at = -1
             self.persist_settings(chat)
             self.reply(chat, "Scheduled reports turned off.")
             return
         if sub == "now":
             self.send_health(chat)
             return
-        self.reply(chat, "Usage: /report status | on <minutes> | off | now")
+        self.reply(chat, "Usage: /report status | on <minutes> | daily <HH:MM> | off | now")
 
     def cmd_remind(self, chat, arg, now):
         usage = "Usage: /remind <minutes 1-10080> <text>"

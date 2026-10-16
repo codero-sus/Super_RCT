@@ -591,6 +591,56 @@ class BotCases:
         self.assertIn("Cooldown between alerts: off", text)
         self.assertIn("Quiet hours: off", text)
 
+    # -- daily report at a set time ---------------------------------------------
+
+    def test_daily_report_is_validated_and_survives_restart(self):
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/report daily 25:00"),
+            make_update(3, ALLOWED_CHAT, "/report daily 7:75"),
+            make_update(4, ALLOWED_CHAT, "/report daily 07:30"),
+        ]], expect_replies=4, SUPER_RCT_STATE_FILE=state)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertIn("Usage: /report daily", replies[1])
+        self.assertIn("Usage: /report daily", replies[2])
+        self.assertIn("Daily health report at 07:30", replies[3])
+        # Restart: the setting is still there, and no report was sent at start-up.
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/report status"),
+        ]], expect_replies=2, SUPER_RCT_STATE_FILE=state)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertEqual(len(replies), 2, replies)
+        self.assertIn("07:30", replies[1])
+
+    def test_daily_report_off_and_interval_clear_each_other(self):
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/report daily 06:00"),
+            make_update(3, ALLOWED_CHAT, "/report off"),
+        ]], expect_replies=3, SUPER_RCT_STATE_FILE=state)
+        replies = self.run_bot([[
+            make_update(1, ALLOWED_CHAT, AUTH),
+            make_update(2, ALLOWED_CHAT, "/report status"),
+        ]], expect_replies=2, SUPER_RCT_STATE_FILE=state)
+        self.assertNotIn("06:00", replies[1])
+
+    def test_nine_field_state_lines_still_load(self):
+        """State written before daily reports (9 fields) keeps cooldown and quiet hours."""
+        state = os.path.join(tempfile.mkdtemp(), "state.txt")
+        with open(state, "w", encoding="utf-8") as f:
+            f.write(f"{ALLOWED_CHAT} 85.0 -1 -1 -1 0 15 22 7\n")
+        replies = self.run_bot([[make_update(1, ALLOWED_CHAT, AUTH),
+                                 make_update(2, ALLOWED_CHAT, "/alert list"),
+                                 make_update(3, ALLOWED_CHAT, "/report status")]],
+                               expect_replies=3, SUPER_RCT_STATE_FILE=state)
+        self.assertEqual(self.exit_code, 0, self.stderr)
+        self.assertIn("Cooldown between alerts: 15 min", replies[1])
+        self.assertIn("Quiet hours (server time): 22:00 to 07:00", replies[1])
+        self.assertNotIn("Daily health report", replies[2])
+
     # -- /run (shell command, behind /auth) ------------------------------------
 
     def test_run_executes_shell_command(self):
@@ -864,6 +914,16 @@ class GeneratedTableTests(unittest.TestCase):
         bot.evaluate_alerts(high, night)
         bot.evaluate_alerts(low, night + 60)
         self.assertEqual(len(sent), before, sent)
+
+    def test_next_daily_schedule(self):
+        import monitor  # noqa: E402
+        t = time.mktime((2026, 1, 5, 12, 0, 0, 0, 0, -1))
+        nxt = time.localtime(monitor.next_daily(t, 7 * 60 + 30))
+        self.assertEqual((nxt.tm_year, nxt.tm_mon, nxt.tm_mday), (2026, 1, 6))
+        self.assertEqual((nxt.tm_hour, nxt.tm_min), (7, 30))
+        # Exactly at the scheduled time the next run is the following day, not now.
+        at = time.mktime((2026, 1, 5, 7, 30, 0, 0, 0, -1))
+        self.assertEqual(monitor.next_daily(at, 7 * 60 + 30) - at, 86400)
 
     def test_table_has_at_least_570_entries(self):
         # 270 entries before this change, plus at least 300 new ones.

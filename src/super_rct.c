@@ -97,6 +97,7 @@ typedef struct {
     time_t last_alert[4]; /* when an ALERT was last sent, per metric */
     time_t fired_at[4];   /* when the current alert was raised */
     bool notified[4];     /* an ALERT was sent and not yet recovered */
+    int daily_at;         /* daily report at this minute after local midnight, -1 = off */
     bool discord;         /* true for a Discord channel, false for Telegram */
     uint64_t dc_cursor;   /* newest Discord message ID handled */
     bool dc_primed;       /* cursor set from the channel's current newest message */
@@ -1414,6 +1415,7 @@ static bool load_config(void) {
     for (int i = 0; i < g_nchats; i++) {
         g_chats[i].quiet_start = -1;
         g_chats[i].quiet_end = -1;
+        g_chats[i].daily_at = -1;
     }
 
     {

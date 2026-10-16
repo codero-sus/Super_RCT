@@ -235,7 +235,7 @@ class ChatState:
     __slots__ = ("chat", "session_until", "fails", "locked_until",
                  "thr", "fired", "report_every", "report_next", "discord",
                  "cooldown_min", "quiet_start", "quiet_end",
-                 "last_alert", "fired_at", "notified")
+                 "last_alert", "fired_at", "notified", "daily_at")
 
     def __init__(self, chat, discord=False):
         self.chat = chat
@@ -253,6 +253,7 @@ class ChatState:
         self.last_alert = [0] * 4  # when an ALERT was last sent, per metric
         self.fired_at = [0] * 4    # when the current alert was raised
         self.notified = [False] * 4  # an ALERT was sent and not yet recovered
+        self.daily_at = -1      # daily report at this minute after local midnight, -1 = off
 
 
 class IpRegistry:

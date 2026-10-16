@@ -454,6 +454,23 @@ static void collect_metrics(metrics_t *m) {
     }
 }
 
+/* The first local time after `now` that is minute_of_day minutes past midnight. */
+static time_t next_daily(time_t now, int minute_of_day) {
+    struct tm lt;
+    time_t nxt;
+
+    if (!localtime_r(&now, &lt))
+        return now + 86400;
+    lt.tm_hour = 0;
+    lt.tm_min = 0;
+    lt.tm_sec = 0;
+    lt.tm_isdst = -1;
+    nxt = mktime(&lt) + (time_t)minute_of_day * 60;
+    while (nxt <= now)
+        nxt += 86400;
+    return nxt;
+}
+
 /* True when `now` (server local time) is inside the chat's quiet hours. */
 static bool in_quiet_hours(const chat_state *c, time_t now) {
     struct tm lt;
@@ -761,8 +778,9 @@ static void monitor_tick(time_t now) {
     for (int i = 0; i < g_nchats; i++) {
         chat_state *c = &g_chats[i];
 
-        if (c->report_every > 0 && now >= c->report_next) {
-            c->report_next = now + c->report_every;
+        if ((c->report_every > 0 || c->daily_at >= 0) && now >= c->report_next) {
+            c->report_next = c->daily_at >= 0 ? next_daily(now, c->daily_at)
+                                              : now + c->report_every;
             send_health(c->chat);
         }
     }
@@ -963,7 +981,7 @@ static void load_state(void) {
         long long chat;
         double thr[METRIC_COUNT];
         long mins;
-        int cool = 0, qs = -1, qe = -1;
+        int cool = 0, qs = -1, qe = -1, daily = -1;
         int used = 0;
         int n;
         const char *rest;
@@ -971,19 +989,32 @@ static void load_state(void) {
 
         if (line[0] == '#' || line[0] == '\n')
             continue;
-        /* Current lines have 9 fields; lines from before cooldowns have 6. */
-        n = sscanf(line, "%lld %lf %lf %lf %lf %ld %d %d %d%n", &chat, &thr[0], &thr[1],
-                   &thr[2], &thr[3], &mins, &cool, &qs, &qe, &used);
-        if (n != 9) {
+        /*
+         * Newest lines have 10 fields. Older lines have 9 (no daily report) or 6
+         * (no cooldown, quiet hours or daily report). Missing fields take defaults.
+         */
+        n = sscanf(line, "%lld %lf %lf %lf %lf %ld %d %d %d %d%n", &chat, &thr[0], &thr[1],
+                   &thr[2], &thr[3], &mins, &cool, &qs, &qe, &daily, &used);
+        if (n != 10) {
             cool = 0;
             qs = -1;
             qe = -1;
+            daily = -1;
+            used = 0;
+            n = sscanf(line, "%lld %lf %lf %lf %lf %ld %d %d %d%n", &chat, &thr[0], &thr[1],
+                       &thr[2], &thr[3], &mins, &cool, &qs, &qe, &used);
+        }
+        if (n != 9 && n != 10) {
+            cool = 0;
+            qs = -1;
+            qe = -1;
+            daily = -1;
             used = 0;
             n = sscanf(line, "%lld %lf %lf %lf %lf %ld%n", &chat, &thr[0], &thr[1],
                        &thr[2], &thr[3], &mins, &used);
         }
         rest = line + used;
-        if ((n != 6 && n != 9) || rest[strspn(rest, " \t\r\n")] != '\0') {
+        if ((n != 6 && n != 9 && n != 10) || rest[strspn(rest, " \t\r\n")] != '\0') {
             fprintf(stderr, "warning: skipping bad line in %s\n", g_statefile);
             continue;
         }
@@ -1002,6 +1033,7 @@ static void load_state(void) {
             ok = ok && cool >= 0 && cool <= COOLDOWN_MAX_MIN;
             ok = ok && ((qs == -1 && qe == -1) ||
                         (qs >= 0 && qs <= 23 && qe >= 0 && qe <= 23 && qs != qe));
+            ok = ok && (daily == -1 || (daily >= 0 && daily <= 1439));
             if (!ok) {
                 fprintf(stderr, "warning: skipping out-of-range settings for chat %lld in %s\n",
                         chat, g_statefile);
@@ -1018,6 +1050,10 @@ static void load_state(void) {
         c->cooldown_min = cool;
         c->quiet_start = qs;
         c->quiet_end = qe;
+        c->daily_at = daily;
+        /* Never "now": a restart must not send a report at once. */
+        if (daily >= 0)
+            c->report_next = next_daily(time(NULL), daily);
     }
     fclose(f);
 }
@@ -1042,7 +1078,8 @@ static bool save_state(void) {
     fputs(STATE_HEADER, f);
     for (int i = 0; i < g_nchats; i++) {
         const chat_state *c = &g_chats[i];
-        bool any = c->report_every > 0 || c->cooldown_min > 0 || c->quiet_start >= 0;
+        bool any = c->report_every > 0 || c->cooldown_min > 0 || c->quiet_start >= 0 ||
+                   c->daily_at >= 0;
 
         for (int k = 0; k < METRIC_COUNT; k++) {
             if (c->thr[k] >= 0)
@@ -1053,8 +1090,8 @@ static bool save_state(void) {
         fprintf(f, "%lld", (long long)c->chat);
         for (int k = 0; k < METRIC_COUNT; k++)
             fprintf(f, " %.17g", c->thr[k]);
-        fprintf(f, " %ld %d %d %d\n", (long)(c->report_every / 60), c->cooldown_min,
-                c->quiet_start, c->quiet_end);
+        fprintf(f, " %ld %d %d %d %d\n", (long)(c->report_every / 60), c->cooldown_min,
+                c->quiet_start, c->quiet_end, c->daily_at);
     }
     ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0)
@@ -1226,7 +1263,11 @@ static void cmd_report(int64_t chat, chat_state *c, const char *arg, time_t now)
     (void)sscanf(arg, "%15s %15s", sub, val);
 
     if (sub[0] == '\0' || strcmp(sub, "status") == 0) {
-        if (c->report_every <= 0) {
+        if (c->daily_at >= 0) {
+            fmt_clock(c->report_next, clock, sizeof clock);
+            reply(chat, "Daily health report at %02d:%02d (server time); next at %s.",
+                  c->daily_at / 60, c->daily_at % 60, clock);
+        } else if (c->report_every <= 0) {
             reply(chat, "Scheduled reports are off. Use /report on <minutes>.");
         } else {
             fmt_clock(c->report_next, clock, sizeof clock);
@@ -1245,12 +1286,30 @@ static void cmd_report(int64_t chat, chat_state *c, const char *arg, time_t now)
         }
         c->report_every = (time_t)mins * 60;
         c->report_next = now + c->report_every;
+        c->daily_at = -1;
         persist_settings(chat);
         reply(chat, "Health reports on: every %ld minutes.", mins);
         return;
     }
+    if (strcmp(sub, "daily") == 0) {
+        int hh = -1, mm = -1;
+        char extra = '\0';
+
+        if (sscanf(val, "%d:%d%c", &hh, &mm, &extra) != 2 || hh < 0 || hh > 23 ||
+            mm < 0 || mm > 59) {
+            reply(chat, "Usage: /report daily <HH:MM>  (server time, 00:00-23:59)");
+            return;
+        }
+        c->daily_at = hh * 60 + mm;
+        c->report_every = 0;
+        c->report_next = next_daily(now, c->daily_at);
+        persist_settings(chat);
+        reply(chat, "Daily health report at %02d:%02d (server time).", hh, mm);
+        return;
+    }
     if (strcmp(sub, "off") == 0) {
         c->report_every = 0;
+        c->daily_at = -1;
         persist_settings(chat);
         reply(chat, "Scheduled reports turned off.");
         return;
@@ -1259,7 +1318,7 @@ static void cmd_report(int64_t chat, chat_state *c, const char *arg, time_t now)
         send_health(chat);
         return;
     }
-    reply(chat, "Usage: /report status | on <minutes> | off | now");
+    reply(chat, "Usage: /report status | on <minutes> | daily <HH:MM> | off | now");
 }
 
 static void cmd_remind(int64_t chat, const char *arg, time_t now) {
