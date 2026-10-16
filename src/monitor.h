@@ -22,6 +22,7 @@
 #define MAX_REMINDERS_PER_CHAT 10
 #define MAX_REMINDER_TEXT 200
 #define EVAL_INTERVAL_S 60
+#define COOLDOWN_MAX_MIN 1440
 #define REPORT_MIN_MIN 5
 #define REPORT_MAX_MIN 1440
 
@@ -453,9 +454,28 @@ static void collect_metrics(metrics_t *m) {
     }
 }
 
-static void evaluate_alerts(const metrics_t *m) {
+/* True when `now` (server local time) is inside the chat's quiet hours. */
+static bool in_quiet_hours(const chat_state *c, time_t now) {
+    struct tm lt;
+    int hour;
+
+    if (c->quiet_start < 0 || !localtime_r(&now, &lt))
+        return false;
+    hour = lt.tm_hour;
+    if (c->quiet_start < c->quiet_end)
+        return hour >= c->quiet_start && hour < c->quiet_end;
+    return hour >= c->quiet_start || hour < c->quiet_end; /* wraps past midnight */
+}
+
+/*
+ * Raises and clears alerts. Quiet hours and the per-metric cooldown suppress ALERT
+ * messages; a RECOVERED message is sent only after an ALERT was sent, and says how
+ * long the alert lasted.
+ */
+static void evaluate_alerts(const metrics_t *m, time_t now) {
     for (int i = 0; i < g_nchats; i++) {
         chat_state *c = &g_chats[i];
+        bool quiet = in_quiet_hours(c, now);
 
         for (int k = 0; k < METRIC_COUNT; k++) {
             double hyst = k == METRIC_LOAD ? 0.2 : 5.0;
@@ -465,15 +485,31 @@ static void evaluate_alerts(const metrics_t *m) {
             if (c->thr[k] < 0 || !m->ok[k])
                 continue;
             if (!c->fired[k] && m->v[k] >= c->thr[k]) {
+                bool cooling = c->cooldown_min > 0 &&
+                               difftime(now, c->last_alert[k]) < c->cooldown_min * 60.0;
+
                 c->fired[k] = true;
+                c->fired_at[k] = now;
+                if (quiet || cooling)
+                    continue; /* the alert stays raised; no message this time */
+                c->last_alert[k] = now;
+                c->notified[k] = true;
                 metric_text(k, m->v[k], vt, sizeof vt);
                 metric_text(k, c->thr[k], tt, sizeof tt);
                 reply(c->chat, "ALERT %s is %s, at or above the limit of %s",
                       metric_name(k), vt, tt);
             } else if (c->fired[k] && m->v[k] < c->thr[k] - hyst) {
+                bool was_notified = c->notified[k];
+                char held[48];
+
                 c->fired[k] = false;
-                metric_text(k, m->v[k], vt, sizeof vt);
-                reply(c->chat, "RECOVERED %s is back to %s", metric_name(k), vt);
+                c->notified[k] = false;
+                if (was_notified && !quiet) {
+                    metric_text(k, m->v[k], vt, sizeof vt);
+                    fmt_duration(difftime(now, c->fired_at[k]), held, sizeof held);
+                    reply(c->chat, "RECOVERED %s is back to %s after %s",
+                          metric_name(k), vt, held);
+                }
             }
         }
     }
@@ -719,7 +755,7 @@ static void monitor_tick(time_t now) {
 
         g_next_eval = now + EVAL_INTERVAL_S;
         collect_metrics(&m);
-        evaluate_alerts(&m);
+        evaluate_alerts(&m, now);
     }
 
     for (int i = 0; i < g_nchats; i++) {
@@ -927,6 +963,7 @@ static void load_state(void) {
         long long chat;
         double thr[METRIC_COUNT];
         long mins;
+        int cool = 0, qs = -1, qe = -1;
         int used = 0;
         int n;
         const char *rest;
@@ -934,10 +971,19 @@ static void load_state(void) {
 
         if (line[0] == '#' || line[0] == '\n')
             continue;
-        n = sscanf(line, "%lld %lf %lf %lf %lf %ld%n", &chat, &thr[0], &thr[1],
-                   &thr[2], &thr[3], &mins, &used);
+        /* Current lines have 9 fields; lines from before cooldowns have 6. */
+        n = sscanf(line, "%lld %lf %lf %lf %lf %ld %d %d %d%n", &chat, &thr[0], &thr[1],
+                   &thr[2], &thr[3], &mins, &cool, &qs, &qe, &used);
+        if (n != 9) {
+            cool = 0;
+            qs = -1;
+            qe = -1;
+            used = 0;
+            n = sscanf(line, "%lld %lf %lf %lf %lf %ld%n", &chat, &thr[0], &thr[1],
+                       &thr[2], &thr[3], &mins, &used);
+        }
         rest = line + used;
-        if (n != 6 || rest[strspn(rest, " \t\r\n")] != '\0') {
+        if ((n != 6 && n != 9) || rest[strspn(rest, " \t\r\n")] != '\0') {
             fprintf(stderr, "warning: skipping bad line in %s\n", g_statefile);
             continue;
         }
@@ -953,6 +999,9 @@ static void load_state(void) {
 
             for (int k = 0; k < METRIC_COUNT; k++)
                 ok = ok && state_value_ok(k, thr[k]);
+            ok = ok && cool >= 0 && cool <= COOLDOWN_MAX_MIN;
+            ok = ok && ((qs == -1 && qe == -1) ||
+                        (qs >= 0 && qs <= 23 && qe >= 0 && qe <= 23 && qs != qe));
             if (!ok) {
                 fprintf(stderr, "warning: skipping out-of-range settings for chat %lld in %s\n",
                         chat, g_statefile);
@@ -962,9 +1011,13 @@ static void load_state(void) {
         for (int k = 0; k < METRIC_COUNT; k++) {
             c->thr[k] = thr[k];
             c->fired[k] = false;
+            c->notified[k] = false;
         }
         c->report_every = (time_t)mins * 60;
         c->report_next = time(NULL) + c->report_every;
+        c->cooldown_min = cool;
+        c->quiet_start = qs;
+        c->quiet_end = qe;
     }
     fclose(f);
 }
@@ -989,7 +1042,7 @@ static bool save_state(void) {
     fputs(STATE_HEADER, f);
     for (int i = 0; i < g_nchats; i++) {
         const chat_state *c = &g_chats[i];
-        bool any = c->report_every > 0;
+        bool any = c->report_every > 0 || c->cooldown_min > 0 || c->quiet_start >= 0;
 
         for (int k = 0; k < METRIC_COUNT; k++) {
             if (c->thr[k] >= 0)
@@ -1000,7 +1053,8 @@ static bool save_state(void) {
         fprintf(f, "%lld", (long long)c->chat);
         for (int k = 0; k < METRIC_COUNT; k++)
             fprintf(f, " %.17g", c->thr[k]);
-        fprintf(f, " %ld\n", (long)(c->report_every / 60));
+        fprintf(f, " %ld %d %d %d\n", (long)(c->report_every / 60), c->cooldown_min,
+                c->quiet_start, c->quiet_end);
     }
     ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0)
@@ -1039,8 +1093,60 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
                 bappendf(&b, "%s: %s\n", metric_name(k), tt);
             }
         }
+        if (c->cooldown_min > 0)
+            bappendf(&b, "Cooldown between alerts: %d min\n", c->cooldown_min);
+        else
+            bappendf(&b, "Cooldown between alerts: off\n");
+        if (c->quiet_start >= 0)
+            bappendf(&b, "Quiet hours (server time): %02d:00 to %02d:00\n", c->quiet_start,
+                     c->quiet_end);
+        else
+            bappendf(&b, "Quiet hours: off\n");
         reply_buf(chat, &b);
         buf_free(&b);
+        return;
+    }
+
+    if (strcmp(sub, "cooldown") == 0) {
+        char *end = NULL;
+        long v = strtol(name, &end, 10);
+
+        if (name[0] == '\0' || *end != '\0' || v < 0 || v > COOLDOWN_MAX_MIN) {
+            reply(chat, "Usage: /alert cooldown <minutes 0-%d> (0 = off)", COOLDOWN_MAX_MIN);
+            return;
+        }
+        c->cooldown_min = (int)v;
+        persist_settings(chat);
+        if (v > 0)
+            reply(chat, "Alert cooldown set to %ld minutes.", v);
+        else
+            reply(chat, "Alert cooldown turned off.");
+        return;
+    }
+
+    if (strcmp(sub, "quiet") == 0) {
+        char *e1 = NULL, *e2 = NULL;
+        long a, b2;
+
+        if (strcmp(name, "off") == 0) {
+            c->quiet_start = c->quiet_end = -1;
+            persist_settings(chat);
+            reply(chat, "Quiet hours turned off.");
+            return;
+        }
+        a = strtol(name, &e1, 10);
+        b2 = strtol(val, &e2, 10);
+        if (name[0] == '\0' || val[0] == '\0' || *e1 != '\0' || *e2 != '\0' ||
+            a < 0 || a > 23 || b2 < 0 || b2 > 23 || a == b2) {
+            reply(chat, "Usage: /alert quiet <start hour 0-23> <end hour 0-23> "
+                        "(server time, end not equal to start) | /alert quiet off");
+            return;
+        }
+        c->quiet_start = (int)a;
+        c->quiet_end = (int)b2;
+        persist_settings(chat);
+        reply(chat, "Quiet hours set: no alerts from %02ld:00 to %02ld:00 (server time).",
+              a, b2);
         return;
     }
 
@@ -1060,6 +1166,7 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
         }
         c->thr[m] = v;
         c->fired[m] = false;
+        c->notified[m] = false;
         persist_settings(chat);
         reply(chat, "Alert for %s set; you will be notified when it is reached.", name);
         return;
@@ -1073,6 +1180,7 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
         }
         c->thr[m] = -1;
         c->fired[m] = false;
+        c->notified[m] = false;
         persist_settings(chat);
         reply(chat, "Alert for %s turned off.", name);
         return;
@@ -1106,7 +1214,8 @@ static void cmd_alert(int64_t chat, chat_state *c, const char *arg) {
         return;
     }
 
-    reply(chat, "Usage: /alert list | set <metric> <value> | off <metric> | check");
+    reply(chat, "Usage: /alert list | set <metric> <value> | off <metric> | check | "
+                "cooldown <minutes> | quiet <start> <end> | quiet off");
 }
 
 static void cmd_report(int64_t chat, chat_state *c, const char *arg, time_t now) {

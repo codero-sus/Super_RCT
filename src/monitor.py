@@ -32,6 +32,7 @@ MAX_REMINDER_TEXT = 200            # bytes
 EVAL_INTERVAL_S = 60
 REPORT_MIN_MIN = 5
 REPORT_MAX_MIN = 1440
+COOLDOWN_MAX_MIN = 1440
 REAL_FS = frozenset({"ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "vfat", "exfat",
                      "ntfs", "ntfs3", "zfs", "jfs"})
 
@@ -338,8 +339,11 @@ def load_state(path, chats):
             chat = int(parts[0])
             thr = [float(x) for x in parts[1:5]]
             minutes = int(parts[5])
-            if len(parts) != 6:
+            if len(parts) not in (6, 9):
                 raise ValueError("wrong field count")
+            # Lines written before cooldowns existed have 6 fields: defaults apply.
+            cooldown, qstart, qend = (0, -1, -1) if len(parts) == 6 else (
+                int(parts[6]), int(parts[7]), int(parts[8]))
         except ValueError:
             print(f"warning: skipping bad line in {path}", file=sys.stderr)
             continue
@@ -348,6 +352,9 @@ def load_state(path, chats):
             continue  # chat no longer allowed in the config
         ok = all(t == -1.0 or (t >= 0 and metric_range(k, t)) for k, t in enumerate(thr))
         ok = ok and (minutes == 0 or REPORT_MIN_MIN <= minutes <= REPORT_MAX_MIN)
+        ok = ok and 0 <= cooldown <= COOLDOWN_MAX_MIN
+        ok = ok and (qstart == -1 and qend == -1 or
+                     (0 <= qstart <= 23 and 0 <= qend <= 23 and qstart != qend))
         if not ok:
             print(f"warning: skipping out-of-range settings for chat {chat} in {path}",
                   file=sys.stderr)
@@ -355,15 +362,34 @@ def load_state(path, chats):
         st.thr = thr
         st.fired = [False] * 4
         st.report_every = minutes * 60
+        st.cooldown_min = cooldown
+        st.quiet_start = qstart
+        st.quiet_end = qend
+
+
+def in_quiet_hours(st, now):
+    """True when `now` (server local time) falls in the chat's quiet hours."""
+    if st.quiet_start < 0:
+        return False
+    hour = time.localtime(now).tm_hour
+    if st.quiet_start < st.quiet_end:
+        return st.quiet_start <= hour < st.quiet_end
+    return hour >= st.quiet_start or hour < st.quiet_end  # wraps past midnight
+
+
+def settings_extra(st):
+    """True when the cooldown or quiet hours differ from their defaults."""
+    return st.cooldown_min > 0 or st.quiet_start >= 0
 
 
 def save_state(path, chats):
     """Writes non-default settings atomically with mode 0600. Returns False on failure."""
     lines = [STATE_HEADER.rstrip("\n")]
     for chat, st in sorted(chats.items()):
-        if all(t < 0 for t in st.thr) and st.report_every <= 0:
+        if all(t < 0 for t in st.thr) and st.report_every <= 0 and not settings_extra(st):
             continue
-        fields = [str(chat)] + [repr(t) for t in st.thr] + [str(st.report_every // 60)]
+        fields = ([str(chat)] + [repr(t) for t in st.thr] + [str(st.report_every // 60)]
+                  + [str(st.cooldown_min), str(st.quiet_start), str(st.quiet_end)])
         lines.append(" ".join(fields))
     tmp = path + ".tmp"
     try:
@@ -432,20 +458,36 @@ class MonitorMixin:
             vals[LOAD] = load[0] / ncpus()
         return vals
 
-    def evaluate_alerts(self, vals):
+    def evaluate_alerts(self, vals, now=None):
+        """Raises and clears alerts. Quiet hours and the per-metric cooldown
+        suppress ALERT messages; a RECOVERED message is sent only after an ALERT
+        was sent, and says how long the alert lasted."""
+        now = time.time() if now is None else now
         for c in self.chats.values():
+            quiet = in_quiet_hours(c, now)
             for k in range(4):
                 if c.thr[k] < 0 or vals[k] is None:
                     continue
                 if not c.fired[k] and vals[k] >= c.thr[k]:
                     c.fired[k] = True
+                    c.fired_at[k] = now
+                    cooling = (c.cooldown_min > 0
+                               and now - c.last_alert[k] < c.cooldown_min * 60)
+                    if quiet or cooling:
+                        continue  # the alert stays raised; no message this time
+                    c.last_alert[k] = now
+                    c.notified[k] = True
                     self.reply(c.chat,
                                f"ALERT {METRIC_NAMES[k]} is {metric_text(k, vals[k])}, "
                                f"at or above the limit of {metric_text(k, c.thr[k])}")
                 elif c.fired[k] and vals[k] < c.thr[k] - HYSTERESIS[k]:
                     c.fired[k] = False
-                    self.reply(c.chat, f"RECOVERED {METRIC_NAMES[k]} is back to "
-                                       f"{metric_text(k, vals[k])}")
+                    was_notified = c.notified[k]
+                    c.notified[k] = False
+                    if was_notified and not quiet:
+                        held = fmt_duration(now - c.fired_at[k])
+                        self.reply(c.chat, f"RECOVERED {METRIC_NAMES[k]} is back to "
+                                           f"{metric_text(k, vals[k])} after {held}")
 
     def build_health(self):
         lines = [f"Health (Super_RCT {self.version})"]
@@ -555,7 +597,7 @@ class MonitorMixin:
         if now >= self.next_eval and any(
                 c.thr[k] >= 0 for c in self.chats.values() for k in range(4)):
             self.next_eval = now + EVAL_INTERVAL_S
-            self.evaluate_alerts(self.collect_metrics())
+            self.evaluate_alerts(self.collect_metrics(), now)
 
         for c in self.chats.values():
             if c.report_every > 0 and now >= c.report_next:
@@ -683,7 +725,47 @@ class MonitorMixin:
                     lines.append(f"{METRIC_NAMES[k]}: off")
                 else:
                     lines.append(f"{METRIC_NAMES[k]}: {metric_text(k, st.thr[k])}")
+            if st.cooldown_min > 0:
+                lines.append(f"Cooldown between alerts: {st.cooldown_min} min")
+            else:
+                lines.append("Cooldown between alerts: off")
+            if st.quiet_start >= 0:
+                lines.append(f"Quiet hours (server time): {st.quiet_start:02d}:00 to "
+                             f"{st.quiet_end:02d}:00")
+            else:
+                lines.append("Quiet hours: off")
             self.reply_long(chat, "\n".join(lines) + "\n")
+            return
+
+        if sub == "cooldown":
+            if not _INT_RE.fullmatch(name) or not 0 <= int(name) <= COOLDOWN_MAX_MIN:
+                self.reply(chat, f"Usage: /alert cooldown <minutes 0-{COOLDOWN_MAX_MIN}> "
+                                 "(0 = off)")
+                return
+            st.cooldown_min = int(name)
+            self.persist_settings(chat)
+            if st.cooldown_min:
+                self.reply(chat, f"Alert cooldown set to {st.cooldown_min} minutes.")
+            else:
+                self.reply(chat, "Alert cooldown turned off.")
+            return
+
+        if sub == "quiet":
+            if name == "off":
+                st.quiet_start = st.quiet_end = -1
+                self.persist_settings(chat)
+                self.reply(chat, "Quiet hours turned off.")
+                return
+            if not (_INT_RE.fullmatch(name) and _INT_RE.fullmatch(val)
+                    and 0 <= int(name) <= 23 and 0 <= int(val) <= 23
+                    and int(name) != int(val)):
+                self.reply(chat, "Usage: /alert quiet <start hour 0-23> <end hour 0-23> "
+                                 "(server time, end not equal to start) | /alert quiet off")
+                return
+            st.quiet_start, st.quiet_end = int(name), int(val)
+            self.persist_settings(chat)
+            self.reply(chat, f"Quiet hours set: no alerts from {st.quiet_start:02d}:00 "
+                             f"to {st.quiet_end:02d}:00 (server time).")
             return
 
         if sub == "set":
@@ -696,6 +778,7 @@ class MonitorMixin:
                 return
             st.thr[m] = float(val)
             st.fired[m] = False
+            st.notified[m] = False
             self.persist_settings(chat)
             self.reply(chat, f"Alert for {name} set; you will be notified when it is reached.")
             return
@@ -707,6 +790,7 @@ class MonitorMixin:
                 return
             st.thr[m] = -1.0
             st.fired[m] = False
+            st.notified[m] = False
             self.persist_settings(chat)
             self.reply(chat, f"Alert for {name} turned off.")
             return
@@ -725,7 +809,8 @@ class MonitorMixin:
             self.reply_long(chat, "\n".join(lines) + "\n")
             return
 
-        self.reply(chat, "Usage: /alert list | set <metric> <value> | off <metric> | check")
+        self.reply(chat, "Usage: /alert list | set <metric> <value> | off <metric> | check | "
+                         "cooldown <minutes> | quiet <start> <end> | quiet off")
 
     def cmd_report(self, chat, st, arg, now):
         parts = arg.split()

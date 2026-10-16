@@ -32,28 +32,29 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 # The bot suite is the slow part. Its two variants and the rest run in parallel
-# (make -j); -O keeps each target's output together.
+# (make -j); -O keeps each target's output together. `all` is built once,
+# first, by `test`, so the parallel targets never rebuild the binary at the same time.
 TEST_JOBS ?= 4
 test: all
 	$(MAKE) -j$(TEST_JOBS) -O test-bot-c test-bot-py test-bot-table test-installers test-builders test-update
 
-test-bot-c: all
+test-bot-c:
 	python3 tests/test_super_rct.py CBotTests
 
-test-bot-py: all
+test-bot-py:
 	python3 tests/test_super_rct.py PythonBotTests
 
-test-bot-table: all
+test-bot-table:
 	python3 tests/test_super_rct.py GeneratedTableTests
 
-test-installers: all
+test-installers:
 	python3 tests/test_installers.py
 
-test-builders: all
+test-builders:
 	python3 tests/test_builder.py
 	python3 tests/test_gui_builder.py
 
-test-update: all
+test-update:
 	python3 tests/test_update.py
 
 gen:

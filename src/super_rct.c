@@ -91,6 +91,12 @@ typedef struct {
     bool fired[4];        /* alert currently raised */
     time_t report_every;  /* scheduled health report interval, 0 = off */
     time_t report_next;
+    int cooldown_min;     /* minutes between ALERTs for one metric, 0 = off */
+    int quiet_start;      /* quiet hours in server local time, -1 = off */
+    int quiet_end;
+    time_t last_alert[4]; /* when an ALERT was last sent, per metric */
+    time_t fired_at[4];   /* when the current alert was raised */
+    bool notified[4];     /* an ALERT was sent and not yet recovered */
     bool discord;         /* true for a Discord channel, false for Telegram */
     uint64_t dc_cursor;   /* newest Discord message ID handled */
     bool dc_primed;       /* cursor set from the channel's current newest message */
@@ -1405,6 +1411,10 @@ static bool load_config(void) {
     for (int i = 0; i < g_nchats; i++)
         for (int k = 0; k < 4; k++)
             g_chats[i].thr[k] = -1.0;
+    for (int i = 0; i < g_nchats; i++) {
+        g_chats[i].quiet_start = -1;
+        g_chats[i].quiet_end = -1;
+    }
 
     {
         const char *wp = getenv("SUPER_RCT_WATCH_PATHS");

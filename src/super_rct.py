@@ -233,7 +233,9 @@ class Telegram:
 
 class ChatState:
     __slots__ = ("chat", "session_until", "fails", "locked_until",
-                 "thr", "fired", "report_every", "report_next", "discord")
+                 "thr", "fired", "report_every", "report_next", "discord",
+                 "cooldown_min", "quiet_start", "quiet_end",
+                 "last_alert", "fired_at", "notified")
 
     def __init__(self, chat, discord=False):
         self.chat = chat
@@ -245,6 +247,12 @@ class ChatState:
         self.fired = [False] * 4
         self.report_every = 0   # scheduled health report interval, 0 = off
         self.report_next = 0
+        self.cooldown_min = 0   # minimum minutes between ALERTs for one metric, 0 = off
+        self.quiet_start = -1   # quiet hours (server local time): no alerts from start
+        self.quiet_end = -1     # to end (hour 0-23); -1 = off
+        self.last_alert = [0] * 4  # when an ALERT was last sent, per metric
+        self.fired_at = [0] * 4    # when the current alert was raised
+        self.notified = [False] * 4  # an ALERT was sent and not yet recovered
 
 
 class IpRegistry:
