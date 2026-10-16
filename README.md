@@ -1,6 +1,7 @@
 # Super_RCT
 
-Remote Control Tool via Telegram, with an IP address registry (enable/disable).
+Remote Control Tool via Telegram and Discord, with an IP address registry
+(enable/disable) and a `/run` command that runs shell commands on the host.
 
 Super_RCT is a small Telegram bot with two interchangeable implementations that
 share the same commands, replies and configuration:
@@ -28,7 +29,8 @@ password login before running any command.
 
 After `/auth`, these commands return live information from the host. Each one
 is either a fixed file read or a fixed program with fixed arguments. None
-accepts user input, and none runs through a shell.
+accepts user input, and none runs through a shell. The one exception is `/run`,
+described below.
 
 | Group | Examples |
 | --- | --- |
@@ -50,12 +52,31 @@ Commands run with a 5-second time limit. Output is capped at about 3.5 KB and
 sent in several messages if a listing is long.
 
 Adding a command means adding one line to `src/commands.def` and running
-`make gen`. Adding a shell command is deliberately not supported. A shell
-command would let anyone who gets past `/auth` run anything on the host.
+`make gen`. Table commands never run through a shell. `/run` is the separate, explicit
+shell command described in the next section.
 
 The IP registry is stored in a plain text file (`super_rct_ips.txt` by default).
-It is informational: Super_RCT does not change firewall rules. Arbitrary shell
-execution is deliberately not offered.
+It is informational: Super_RCT does not change firewall rules.
+
+## Running shell commands: /run
+
+`/run <command>` runs the text through `/bin/sh` on the host, from any chat that
+has logged in with `/auth`, on Telegram and Discord alike. It is **on by default**.
+Anyone with the password can run any command as the user the bot runs as, so run
+the bot as a normal user unless it truly needs root.
+
+- Command text: up to 1000 bytes.
+- Time limit: 60 seconds. A command that runs longer is killed together with the
+  background processes it started.
+- Output: the first 3500 characters are sent, with the exit code.
+- Audit log: each run is written to stderr with the chat ID, exit status and
+  command text. Output is not logged. Commands can contain secrets, so the log
+  should be protected.
+- Turn it off with `SUPER_RCT_SHELL=0`. Any value other than `0` or `1` stops
+  the bot at startup.
+
+Passwords and commands typed in chat stay in the chat history of Telegram or
+Discord.
 
 ## Monitoring and utilities (29)
 
@@ -85,7 +106,7 @@ Alert limits and report schedules are saved to `SUPER_RCT_STATE_FILE` (default
 `super_rct_state.txt`) after each change, written with mode 0600, and restored
 on restart. Reminders and counters are kept in memory and reset when the bot
 restarts. Nothing here captures the screen, camera, microphone,
-keyboard or clipboard, and nothing runs an arbitrary shell command.
+keyboard or clipboard. The only shell access is `/run` (see below).
 
 ## Authentication
 
@@ -215,6 +236,7 @@ Environment variables:
 | `SUPER_RCT_API` | no | `https://api.telegram.org` |
 | `SUPER_RCT_WATCH_PATHS` | no (comma-separated absolute paths, max 16) | - |
 | `SUPER_RCT_WATCH_MAX_AGE_HOURS` | no (1-8760) | `24` |
+| `SUPER_RCT_SHELL` | no (0 or 1) | `1` (`/run` enabled) |
 
 Keep the token out of version control. Put it in your shell environment or a
 secrets manager, not in a committed file.
