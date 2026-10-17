@@ -51,20 +51,22 @@ jobs:
         if: contains(matrix.targets, 'py-nuitka')
         run: python -m pip install --upgrade pip nuitka ordered-set zstandard
 
-      - name: Run the unit tests for the builder
+      # Each part is its own step so a failure shows up by name in the run summary.
+      - name: Builder tests - arguments, dry runs, wizard, refusals
         shell: bash
-        run: |
-          set -o pipefail
-          python -m unittest discover -s tests -p test_builder.py -v 2>&1 | tee builder-tests.log
+        working-directory: tests
+        run: python -m unittest test_builder.ArgumentTests test_builder.DryRunTests test_builder.WizardTests test_builder.PlatformRefusalTests -v
 
-      - name: Keep the builder test log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: builder-tests-${{ matrix.tag }}
-          path: builder-tests.log
-          if-no-files-found: ignore
-          retention-days: 7
+      - name: Builder test - build and run the Python archive
+        shell: bash
+        working-directory: tests
+        run: python -m unittest test_builder.RealBuildTests.test_python_archive_runs -v
+
+      - name: Builder test - build and run the C binary
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: tests
+        run: python -m unittest test_builder.RealBuildTests.test_c_binary_runs -v
 
       - name: Build the targets
         shell: bash
