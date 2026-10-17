@@ -29,6 +29,10 @@
  *   SUPER_RCT_SHELL            1 (default) allows /run; 0 turns it off
  */
 
+#if defined(__APPLE__)
+/* macOS hides some declarations (e.g. _SC_NPROCESSORS_ONLN, BSD types) unless this is set. */
+#define _DARWIN_C_SOURCE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <arpa/inet.h>
