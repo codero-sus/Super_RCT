@@ -16,6 +16,11 @@ DEPS    := $(wildcard src/*.h)
 
 RELFLAGS := -Os -s -ffunction-sections -fdata-sections
 RELLDFLAGS := -Wl,--gc-sections
+# macOS's linker has no --gc-sections; it uses -dead_strip instead.
+ifeq ($(shell uname -s),Darwin)
+RELFLAGS := -Os -ffunction-sections -fdata-sections
+RELLDFLAGS := -Wl,-dead_strip
+endif
 
 .PHONY: all release test test-bot-c test-bot-py test-bot-table test-installers test-builders test-update size gen check-gen update clean
 

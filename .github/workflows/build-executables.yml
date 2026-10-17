@@ -1,0 +1,119 @@
+# Builds Super_RCT executables on Linux, macOS and Windows with tools/builder.py.
+#
+#   Linux    C binary, Python zipapp, Nuitka executable, Linux installers
+#   macOS    C binary, Python zipapp, Nuitka executable
+#   Windows  Python zipapp, Nuitka executable (.exe)
+#
+# The C bot uses POSIX calls (fork, poll), so there is no Windows C build yet.
+#
+# Runs on: manual start (Actions tab or `gh workflow run`), pushes to main and
+# arena/** branches, pull requests to main, and version tags (v*). Tags also
+# publish a GitHub Release with the executables attached.
+
+name: Build executables
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "arena/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: "c py-zipapp py-nuitka installers"
+            tag: linux
+          - os: macos-latest
+            targets: "c py-zipapp py-nuitka"
+            tag: macos
+          - os: windows-latest
+            targets: "py-zipapp py-nuitka"
+            tag: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Nuitka
+        if: contains(matrix.targets, 'py-nuitka')
+        run: python -m pip install --upgrade pip nuitka ordered-set zstandard
+
+      - name: Run the unit tests for the builder
+        shell: bash
+        run: python -m unittest discover -s tests -p test_builder.py -v
+
+      - name: Build the targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for t in ${{ matrix.targets }}; do
+            case "$t" in
+              c)           name=super_rct-c ;;
+              py-zipapp)   name=super_rct ;;
+              py-nuitka)   name=super_rct-nuitka ;;
+              installers)  name=super_rct-installers ;;
+            esac
+            python tools/builder.py --target "$t" --out dist --name "$name"
+          done
+          ls -la dist
+
+      - name: Smoke test - each program prints its version
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for f in dist/super_rct.pyz dist/super_rct-c dist/super_rct-c.exe \
+                   dist/super_rct-nuitka dist/super_rct-nuitka.exe; do
+            [ -f "$f" ] || continue
+            echo "== $f"
+            if [[ "$f" == *.pyz ]]; then python "$f" --version; else "$f" --version; fi
+            found=$((found + 1))
+          done
+          test "$found" -gt 0
+
+      - name: Upload executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: super_rct-${{ matrix.tag }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: super_rct-*
+          merge-multiple: true
+
+      - name: Create the release with every executable attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -la artifacts
+          gh release create "$TAG" artifacts/* \
+            --title "Super_RCT $TAG" \
+            --notes "Executables for Linux, macOS and Windows, built by .github/workflows/build-executables.yml."
