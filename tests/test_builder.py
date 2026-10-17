@@ -102,6 +102,23 @@ class WizardTests(unittest.TestCase):
         self.assertIn("tool.pyz", text)
 
 
+class PlatformRefusalTests(unittest.TestCase):
+    """On Windows the C bot and the installers are refused with a clear reason."""
+
+    def test_c_and_installers_refused_on_windows(self):
+        out = tempfile.mkdtemp(prefix="srct-win-")
+        try:
+            for target, needle in (("c", "POSIX"), ("installers", "Linux")):
+                with self.subTest(target=target), \
+                        mock.patch.object(builder.sys, "platform", "win32"):
+                    code, _, err = run_main(["--target", target, "--out", out])
+                    self.assertEqual(code, 1)
+                    self.assertIn(needle, err)
+            self.assertFalse(os.path.exists(os.path.join(out, "super_rct")))
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+
 class RealBuildTests(unittest.TestCase):
     """Builds real artifacts into a temporary folder and runs them."""
 
@@ -124,6 +141,7 @@ class RealBuildTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(res.stdout.strip(), f"super_rct {VERSION}")
 
+    @unittest.skipIf(sys.platform == "win32", "the C bot is POSIX-only")
     def test_c_binary_runs(self):
         code, _, err = run_main(["--target", "c", "--out", self.out, "--name", "srct_c"])
         self.assertEqual(code, 0, err)

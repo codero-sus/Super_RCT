@@ -53,7 +53,18 @@ jobs:
 
       - name: Run the unit tests for the builder
         shell: bash
-        run: python -m unittest discover -s tests -p test_builder.py -v
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -p test_builder.py -v 2>&1 | tee builder-tests.log
+
+      - name: Keep the builder test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: builder-tests-${{ matrix.tag }}
+          path: builder-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build the targets
         shell: bash
