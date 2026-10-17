@@ -173,6 +173,12 @@ def execute(plan, emit=print):
         for step in steps:
             emit(f"  - {describe(step)}")
         return 0
+    if plan.target == "c" and sys.platform == "win32":
+        raise BuildError("the C bot uses POSIX calls (fork, poll), so it cannot be built on "
+                         "Windows. Use py-zipapp or py-nuitka instead, or build the C binary "
+                         "on Linux or macOS.")
+    if plan.target == "installers" and sys.platform != "linux":
+        raise BuildError("the installers are for Linux; build them on Linux.")
     for number, step in enumerate(steps, 1):
         emit(f"[{number}/{len(steps)}] {step.text}")
         try:
