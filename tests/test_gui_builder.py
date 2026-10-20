@@ -37,10 +37,10 @@ class FormTests(unittest.TestCase):
 
 class PreviewTests(unittest.TestCase):
     def test_preview_lists_steps_and_runs_nothing(self):
-        plan = builder.Plan(target="py-zipapp", out_dir=Path("/tmp/none"), name="t")
+        plan = builder.Plan(target="c", out_dir=Path("/tmp/none"), name="t")
         lines = gui_builder.preview_lines(plan)
-        self.assertTrue(lines[0].startswith("Steps for py-zipapp"))
-        self.assertTrue(any("t.pyz" in line for line in lines))
+        self.assertTrue(lines[0].startswith("Steps for c"))
+        self.assertTrue(any("make release" in line for line in lines))
         self.assertFalse(os.path.exists("/tmp/none"))
 
     def test_preview_reports_missing_nuitka(self):
@@ -85,13 +85,13 @@ class RunTests(unittest.TestCase):
         self.assertEqual(gui_builder.run_build(plan, lines.append), 1)
         self.assertIn("unknown target", lines[-1])
 
-    def test_real_python_archive_build_through_gui_logic(self):
+    def test_real_c_build_through_gui_logic(self):
         out = Path(os.environ.get("TMPDIR", "/tmp")) / f"srct-gui-{os.getpid()}"
         lines = []
-        plan = builder.Plan(target="py-zipapp", out_dir=out, name="gui_test")
+        plan = builder.Plan(target="c", out_dir=out, name="gui_test")
         try:
             self.assertEqual(gui_builder.run_build(plan, lines.append), 0, lines)
-            self.assertTrue((out / "gui_test.pyz").exists())
+            self.assertTrue((out / "gui_test").exists())
         finally:
             for item in out.glob("*"):
                 item.unlink()
