@@ -1,8 +1,10 @@
 # Builds Super_RCT executables on Linux, macOS and Windows with tools/builder.py.
 #
-#   Linux    C binary, Python zipapp, Nuitka executable, Linux installers
-#   macOS    C binary, Python zipapp, Nuitka executable
-#   Windows  Python zipapp, Nuitka executable (.exe)
+#   Linux    C binary, Python onefile (Nuitka), Linux installers
+#   macOS    C binary, Python onefile (Nuitka)
+#   Windows  Python onefile (Nuitka .exe)
+#
+# Every output is one file that runs without installing Python.
 #
 # The C bot uses POSIX calls (fork, poll), so there is no Windows C build yet.
 #
@@ -32,13 +34,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            targets: "c py-zipapp py-nuitka installers"
+            targets: "c py-nuitka installers"
             tag: linux
           - os: macos-latest
-            targets: "c py-zipapp py-nuitka"
+            targets: "c py-nuitka"
             tag: macos
           - os: windows-latest
-            targets: "py-zipapp py-nuitka"
+            targets: "py-nuitka"
             tag: windows
     steps:
       - uses: actions/checkout@v4
@@ -57,10 +59,10 @@ jobs:
         working-directory: tests
         run: python -m unittest test_builder.ArgumentTests test_builder.DryRunTests test_builder.WizardTests test_builder.PlatformRefusalTests -v
 
-      - name: Builder test - build and run the Python archive
+      - name: Builder test - the Python target is one onefile executable
         shell: bash
         working-directory: tests
-        run: python -m unittest test_builder.RealBuildTests.test_python_archive_runs -v
+        run: python -m unittest test_builder.RealBuildTests.test_python_target_is_onefile -v
 
       - name: Builder test - build and run the C binary
         if: runner.os != 'Windows'
@@ -76,7 +78,6 @@ jobs:
           for t in ${{ matrix.targets }}; do
             case "$t" in
               c)           name=super_rct-c ;;
-              py-zipapp)   name=super_rct ;;
               py-nuitka)   name=super_rct-nuitka ;;
               installers)  name=super_rct-installers ;;
             esac
@@ -89,11 +90,11 @@ jobs:
         run: |
           set -euo pipefail
           found=0
-          for f in dist/super_rct.pyz dist/super_rct-c dist/super_rct-c.exe \
+          for f in dist/super_rct-c dist/super_rct-c.exe \
                    dist/super_rct-nuitka dist/super_rct-nuitka.exe; do
             [ -f "$f" ] || continue
             echo "== $f"
-            if [[ "$f" == *.pyz ]]; then python "$f" --version; else "$f" --version; fi
+            "$f" --version
             found=$((found + 1))
           done
           test "$found" -gt 0

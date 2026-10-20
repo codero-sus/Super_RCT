@@ -173,7 +173,7 @@ Or pass arguments to build without prompts:
 
 ```sh
 python3 tools/builder.py --target c            # C binary, build/dist/super_rct
-python3 tools/builder.py --target py-zipapp    # Python archive, build/dist/super_rct.pyz
+python3 tools/builder.py --target py-nuitka    # Python onefile executable, build/dist/
 python3 tools/builder.py --target installers   # Linux installers, build/dist/
 python3 tools/builder.py --list                # list the targets
 python3 tools/builder.py --help                # every option (--out, --name, --dry-run)

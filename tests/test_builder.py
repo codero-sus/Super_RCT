@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -59,7 +60,7 @@ class DryRunTests(unittest.TestCase):
     def test_every_target_dry_run_creates_nothing(self):
         out = tempfile.mkdtemp()
         target_dir = os.path.join(out, "dist")
-        for target in ("c", "py-zipapp", "installers", "py-nuitka"):
+        for target in ("c", "installers", "py-nuitka"):
             with self.subTest(target=target):
                 args = ["--target", target, "--out", target_dir, "--dry-run"]
                 if target == "py-nuitka":
@@ -89,17 +90,18 @@ class WizardTests(unittest.TestCase):
         self.assertIn("Cancelled", buf.getvalue())
 
     def test_wizard_rejects_bad_choice_and_name_then_retries(self):
-        # bad choice 9, then 2 (py-zipapp); bad name, then a good name; dry run; start
-        answers = ["9", "2", "", "bad name", "tool", "y", "y"]
+        # bad choice 9, then 1 (c); bad name, then a good name; dry run; start
+        answers = ["9", "1", "", "bad name", "tool", "y", "y"]
         with mock.patch("builtins.input", side_effect=answers), \
                 contextlib.redirect_stdout(io.StringIO()) as buf:
             code = builder.wizard()
         self.assertEqual(code, 0)
         text = buf.getvalue()
-        self.assertIn("Enter a number from 1 to 4", text)
+        self.assertIn("Enter a number from 1 to", text)
         self.assertIn("bad name", text)
         self.assertIn("Dry run", text)
-        self.assertIn("tool.pyz", text)
+        self.assertIn("Copy the binary to", text)
+        self.assertIn("tool", text)
 
 
 class PlatformRefusalTests(unittest.TestCase):
@@ -130,16 +132,14 @@ class RealBuildTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.out, ignore_errors=True)
 
-    def test_python_archive_runs(self):
-        code, _, err = run_main(["--target", "py-zipapp", "--out", self.out,
-                                 "--name", "srct_test"])
-        self.assertEqual(code, 0, err)
-        pyz = os.path.join(self.out, "srct_test.pyz")
-        self.assertTrue(os.access(pyz, os.X_OK))
-        res = subprocess.run([sys.executable, pyz, "--version"], capture_output=True,
-                             text=True, timeout=30)
-        self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertEqual(res.stdout.strip(), f"super_rct {VERSION}")
+    def test_python_target_is_onefile(self):
+        """The Python target is one Nuitka executable (--onefile), not a folder or archive."""
+        plan = builder.Plan(target="py-nuitka", out_dir=Path(self.out), name="srct_py")
+        with mock.patch.object(builder.importlib.util, "find_spec", return_value=object()):
+            steps = builder.build_steps(plan)
+        argv = next(step.run[0] for step in steps if isinstance(step.run, tuple))
+        self.assertIn("--onefile", argv)
+        self.assertIn("--output-filename=srct_py", argv)
 
     @unittest.skipIf(sys.platform == "win32", "the C bot is POSIX-only")
     def test_c_binary_runs(self):

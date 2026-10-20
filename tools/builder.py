@@ -16,7 +16,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import zipapp
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -31,8 +30,7 @@ PY_FILES = ("super_rct.py", "monitor.py", "commands_table.py", "discord_transpor
 
 TARGETS = {
     "c": "C binary: smallest, no Python needed (make release)",
-    "py-zipapp": "Python archive: one file, runs with python3, no extra tools",
-    "py-nuitka": "Python native executable via Nuitka (needs Nuitka and C headers)",
+    "py-nuitka": "Python onefile executable via Nuitka (needs Nuitka and a C compiler)",
     "installers": "Linux installers, C and Python: each embeds the bot and sets it up",
 }
 
@@ -79,22 +77,6 @@ def make_executable(path):
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def zipapp_step(plan):
-    stage = Path(tempfile.mkdtemp(prefix="srct-stage-"))
-    try:
-        stage_python_sources(stage)
-        (stage / "__main__.py").write_text(
-            "import sys\nfrom super_rct import main\n\nsys.exit(main(sys.argv))\n",
-            encoding="utf-8")
-        plan.out_dir.mkdir(parents=True, exist_ok=True)
-        target = plan.out_dir / f"{plan.name}.pyz"
-        zipapp.create_archive(stage, target, interpreter="/usr/bin/env python3",
-                              compressed=True)
-        make_executable(target)
-    finally:
-        shutil.rmtree(stage, ignore_errors=True)
-
-
 def c_copy_step(plan):
     plan.out_dir.mkdir(parents=True, exist_ok=True)
     built = ROOT / "build" / "super_rct"
@@ -133,8 +115,6 @@ def build_steps(plan):
     if plan.target == "c":
         return [Step("Compile the C bot (make release)", (["make", "release"], ROOT)),
                 Step(f"Copy the binary to {plan.out_dir / plan.name}", c_copy_step)]
-    if plan.target == "py-zipapp":
-        return [Step(f"Create {plan.out_dir / (plan.name + '.pyz')}", zipapp_step)]
     if plan.target == "py-nuitka":
         return nuitka_steps(plan)
     if plan.target == "installers":
@@ -175,7 +155,7 @@ def execute(plan, emit=print):
         return 0
     if plan.target == "c" and sys.platform == "win32":
         raise BuildError("the C bot uses POSIX calls (fork, poll), so it cannot be built on "
-                         "Windows. Use py-zipapp or py-nuitka instead, or build the C binary "
+                         "Windows. Use py-nuitka instead, or build the C binary "
                          "on Linux or macOS.")
     if plan.target == "installers" and sys.platform != "linux":
         raise BuildError("the installers are for Linux; build them on Linux.")
