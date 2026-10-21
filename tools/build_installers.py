@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Builds the Linux installers into build/installers/ (not committed).
 
-  python3 tools/build_installers.py
+  python3 tools/build_installers.py                     both protocols
+  python3 tools/build_installers.py --protocol discord  one protocol
 
-Python installer: src/install/linux.py with the bot bundle embedded (a zip of
-the Python files, base64). C installer: src/install/linux.c with the release
-bot binary embedded (base64), compiled with cc. Each installer then extracts
-its embedded bot into the directory it is run from.
+For each protocol there are two installers, one per language:
+  super_rct-<protocol>-linux.py   Python build, bot bundle embedded (zip, base64)
+  super_rct-<protocol>-linux      C build, release bot binary embedded (base64)
+
+Each installer extracts its embedded bot into the directory it is run from.
+The C installer is compiled with cc. The bot inside is built for the protocol
+named in the file name, so each installer serves only that protocol.
 """
 
+import argparse
 import base64
 import io
 import os
@@ -22,13 +27,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "installers")
 PY_BUNDLE = ["super_rct.py", "monitor.py", "discord_transport.py", "commands_table.py",
              "build_protocol.py"]
+PROTOCOLS = ("telegram", "discord")
 
 
-def python_installer():
+def python_installer(protocol):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in PY_BUNDLE:
-            z.write(os.path.join(ROOT, "src", name), name)
+            if name == "build_protocol.py":
+                z.writestr(name, f'PROTOCOL = "{protocol}"\n')
+            else:
+                z.write(os.path.join(ROOT, "src", name), name)
     payload = base64.b64encode(buf.getvalue()).decode()
 
     with open(os.path.join(ROOT, "src", "install", "linux.py"), encoding="utf-8") as f:
@@ -36,16 +45,17 @@ def python_installer():
     src, count = re.subn(r'^PAYLOAD = ""', f'PAYLOAD = "{payload}"', src, count=1, flags=re.M)
     assert count == 1, "payload placeholder not found in linux.py"
 
-    dest = os.path.join(OUT, "super_rct-linux.py")
+    dest = os.path.join(OUT, f"super_rct-{protocol}-linux.py")
     with open(dest, "w", encoding="utf-8") as f:
         f.write(src)
     os.chmod(dest, os.stat(dest).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return dest
 
 
-def c_installer():
+def c_installer(protocol):
     binary = os.path.join(ROOT, "build", "super_rct")
-    subprocess.run(["make", "-C", ROOT, "release"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["make", "-C", ROOT, "release", f"PROTOCOL={protocol}"], check=True,
+                   stdout=subprocess.DEVNULL)
     with open(binary, "rb") as f:
         payload = base64.b64encode(f.read()).decode()
 
@@ -58,20 +68,26 @@ def c_installer():
                          src, count=1, flags=re.M)
     assert count == 1, "payload placeholder not found in linux.c"
 
-    src_path = os.path.join(OUT, "super_rct-linux.c")
+    src_path = os.path.join(OUT, f"super_rct-{protocol}-linux.c")
     with open(src_path, "w", encoding="utf-8") as f:
         f.write(src)
-    dest = os.path.join(OUT, "super_rct-linux")
+    dest = os.path.join(OUT, f"super_rct-{protocol}-linux")
     subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Wshadow",
                     "-Wformat=2", "-s", "-o", dest, src_path], check=True)
     os.remove(src_path)
     return dest
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    parser.add_argument("--protocol", choices=("both",) + PROTOCOLS, default="both")
+    args = parser.parse_args(argv)
+    protocols = PROTOCOLS if args.protocol == "both" else (args.protocol,)
+
     os.makedirs(OUT, exist_ok=True)
-    for path in (python_installer(), c_installer()):
-        print(f"built {os.path.relpath(path, ROOT)} ({os.path.getsize(path)} bytes)")
+    for protocol in protocols:
+        for path in (python_installer(protocol), c_installer(protocol)):
+            print(f"built {os.path.relpath(path, ROOT)} ({os.path.getsize(path)} bytes)")
     return 0
 
 

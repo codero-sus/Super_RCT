@@ -129,6 +129,15 @@ static volatile sig_atomic_t g_stop = 0;
 static int g_shell_enabled = 1; /* SUPER_RCT_SHELL: 1 = /run allowed */
 static time_t g_started;
 static char g_token[MAX_TOKEN];
+/* Discord state is always declared so the shared code can refer to it; it is
+ * only used by builds that include the Discord transport (see USE_DISCORD). */
+#define DEFAULT_DISCORD_API "https://discord.com/api/v10"
+#if USE_DISCORD
+static char g_discord_token[MAX_TOKEN];
+static char g_discord_api[MAX_URL] = DEFAULT_DISCORD_API;
+static time_t g_next_discord_poll;
+#endif
+static bool g_discord_on;
 static char g_password[MAX_PASSWORD + 1];
 static char g_api[MAX_URL] = DEFAULT_API;
 static char g_ipfile[MAX_URL] = DEFAULT_IP_FILE;
@@ -511,7 +520,9 @@ static ip_entry *ip_find(const char *ip) {
     return NULL;
 }
 
+#if USE_DISCORD
 #include "discord_transport.h"
+#endif
 
 static void ip_load(void) {
     FILE *f = fopen(g_ipfile, "r");
@@ -600,9 +611,13 @@ static int chat_index(int64_t chat) {
 static void send_text(int64_t chat, const char *text) {
     int i = chat_index(chat);
 
+#if USE_DISCORD
     if (i >= 0 && g_chats[i].discord)
         discord_send(chat, text);
     else
+#else
+    (void)i;
+#endif
         tg_send_text(chat, text);
 }
 
@@ -1392,6 +1407,7 @@ static bool load_config(void) {
             fprintf(stderr, "error: SUPER_RCT_DISCORD_TOKEN is required in the Discord build\n");
             return false;
         }
+#if USE_DISCORD
         if (da && *da) {
             if (strlen(da) >= MAX_URL) {
                 fprintf(stderr, "error: SUPER_RCT_DISCORD_API is too long\n");
@@ -1447,6 +1463,7 @@ static bool load_config(void) {
                 p++;
             }
         }
+#endif
     }
 
     for (int i = 0; i < g_nchats; i++)
@@ -1599,12 +1616,14 @@ int main(int argc, char **argv) {
                 sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
             buf_free(&resp);
         }
-        if (USE_DISCORD && g_discord_on && time(NULL) >= g_next_discord_poll) {
+#if USE_DISCORD
+        if (g_discord_on && time(NULL) >= g_next_discord_poll) {
             g_next_discord_poll = time(NULL) + DISCORD_POLL_S;
             for (int i = 0; i < g_nchats; i++)
                 if (g_chats[i].discord)
                     discord_poll(&g_chats[i], handle_message);
         }
+#endif
         monitor_tick(time(NULL));
     }
 

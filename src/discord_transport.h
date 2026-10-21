@@ -8,7 +8,6 @@
  * "Message Content" privileged intent, or message text arrives empty.
  */
 
-#define DEFAULT_DISCORD_API "https://discord.com/api/v10"
 #define DISCORD_MAX_MSG 1900 /* Discord allows 2000 characters */
 #define DISCORD_POLL_S 3
 #define DISCORD_BATCH 50
@@ -19,10 +18,6 @@ typedef struct {
     char text[MAX_TEXT];
 } discord_msg;
 
-static char g_discord_token[MAX_TOKEN];
-static char g_discord_api[MAX_URL] = DEFAULT_DISCORD_API;
-static bool g_discord_on;
-static time_t g_next_discord_poll;
 static discord_msg g_dmsgs[DISCORD_BATCH];
 
 static bool discord_token_valid(const char *t) {
