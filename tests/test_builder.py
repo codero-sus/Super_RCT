@@ -147,10 +147,12 @@ class ProtocolTests(unittest.TestCase):
     """The chosen protocol reaches the C build (make flag) and the Python copy."""
 
     def test_protocol_reaches_make_and_python_stage(self):
+        # The make path is the POSIX build; Windows uses its own compile step (tested below).
         plan = builder.Plan(target="c", out_dir=Path("/tmp/none"), name="t",
                             dry_run=True, protocol="discord")
-        argv = next(step.run[0] for step in builder.build_steps(plan)
-                    if isinstance(step.run, tuple))
+        with mock.patch.object(builder.sys, "platform", "linux"):
+            argv = next(step.run[0] for step in builder.build_steps(plan)
+                        if isinstance(step.run, tuple))
         self.assertIn("PROTOCOL=discord", argv)
         with tempfile.TemporaryDirectory() as tmp:
             builder.stage_python_sources(Path(tmp), "telegram")
