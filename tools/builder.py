@@ -31,7 +31,7 @@ PY_FILES = ("super_rct.py", "monitor.py", "commands_table.py", "discord_transpor
 PROTOCOLS = ("both", "telegram", "discord")
 
 TARGETS = {
-    "c": "C binary: smallest, no Python needed (make release)",
+    "c": "C binary: smallest, no Python needed (make release; gcc or ziglang on Windows)",
     "py-nuitka": "Python onefile executable via Nuitka (needs Nuitka and a C compiler)",
     "installers": "Linux installers, C and Python: each embeds the bot and sets it up",
 }
@@ -119,8 +119,44 @@ def nuitka_steps(plan):
     ]
 
 
+# Same values as SRCT_PROTOCOL in the C code and the Makefile.
+PROTOCOL_IDS = {"both": 0, "telegram": 1, "discord": 2}
+WINDOWS_LIBS = ["-lws2_32", "-liphlpapi"]
+NO_COMPILER_TEXT = ("no C compiler found. Install MinGW (gcc on PATH) or run: "
+                    f"{sys.executable} -m pip install ziglang")
+
+
+def windows_c_compiler():
+    """Returns the argv that starts a C compiler on Windows, or None.
+
+    MinGW gcc is used when it is on PATH; otherwise ziglang (pip install ziglang),
+    which bundles a C compiler.
+    """
+    if shutil.which("gcc"):
+        return ["gcc"]
+    if importlib.util.find_spec("ziglang") is not None:
+        return [sys.executable, "-m", "ziglang", "cc"]
+    return None
+
+
+def windows_c_steps(plan):
+    """One Windows executable for `plan`: C source, one protocol, Winsock and IP Helper."""
+    compiler = windows_c_compiler() or [f"<{NO_COMPILER_TEXT}>"]
+    exe = plan.name if plan.name.lower().endswith(".exe") else plan.name + ".exe"
+    target = plan.out_dir / exe
+    argv = compiler + ["-std=c11", "-O2", "-s", "-Wall", "-Wextra",
+                       f"-DSRCT_PROTOCOL={PROTOCOL_IDS[plan.protocol]}",
+                       "-o", str(target), str(SRC / "super_rct.c"), *WINDOWS_LIBS]
+    return [Step(f"Make the output folder {plan.out_dir}",
+                 lambda p: p.out_dir.mkdir(parents=True, exist_ok=True)),
+            Step(f"Compile the C bot for Windows, {plan.protocol} protocol, into {target}",
+                 (argv, ROOT))]
+
+
 def build_steps(plan):
     """Returns the ordered steps for `plan`. Raises BuildError for bad combinations."""
+    if plan.target == "c" and sys.platform == "win32":
+        return windows_c_steps(plan)
     if plan.target == "c":
         return [Step(f"Compile the C bot for the {plan.protocol} protocol (make release)",
                      (["make", "release", f"PROTOCOL={plan.protocol}"], ROOT)),
@@ -164,10 +200,8 @@ def execute(plan, emit=print):
         for step in steps:
             emit(f"  - {describe(step)}")
         return 0
-    if plan.target == "c" and sys.platform == "win32":
-        raise BuildError("the C bot uses POSIX calls (fork, poll), so it cannot be built on "
-                         "Windows. Use py-nuitka instead, or build the C binary "
-                         "on Linux or macOS.")
+    if plan.target == "c" and sys.platform == "win32" and windows_c_compiler() is None:
+        raise BuildError(NO_COMPILER_TEXT)
     if plan.target == "installers" and sys.platform != "linux":
         raise BuildError("the installers are for Linux; build them on Linux.")
     for number, step in enumerate(steps, 1):
