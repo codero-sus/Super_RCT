@@ -35,25 +35,17 @@
 #endif
 #define _POSIX_C_SOURCE 200809L
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <time.h>
-#include <unistd.h>
 
+#include "platform.h"
 #include "commands_table.h"
 
 /*
@@ -165,7 +157,7 @@ static void logf_(const char *fmt, ...) {
     struct tm tmv;
     va_list ap;
 
-    localtime_r(&now, &tmv);
+    plat_localtime(now, &tmv);
     strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
     fprintf(stderr, "[%s] ", ts);
     va_start(ap, fmt);
@@ -250,84 +242,29 @@ static void on_signal(int sig) {
  * Runs `curl -s -K -` with `cfg` on stdin and captures stdout into `out`.
  * Returns 0 on success, -1 on any failure.
  */
+static void sink_buf(void *ctx, const char *data, size_t n) {
+    buf_add((buf_t *)ctx, data, n);
+}
+
+/*
+ * Runs `curl -s -K -` with `cfg` on stdin and captures stdout into `out`.
+ * Returns 0 on success, -1 on any failure.
+ */
 static int run_curl(const buf_t *cfg, buf_t *out) {
-    int in_p[2];
-    int out_p[2];
-    pid_t pid;
-    size_t off = 0;
-    bool ok = true;
-    int status = 0;
-    char chunk[4096];
+    char *const argv[] = {"curl", "-s", "-K", "-", NULL};
+    plat_run_t r = {0};
+    int rc;
 
-    if (pipe(in_p) < 0)
-        return -1;
-    if (pipe(out_p) < 0) {
-        close(in_p[0]);
-        close(in_p[1]);
-        return -1;
-    }
-
-    pid = fork();
-    if (pid < 0) {
-        close(in_p[0]);
-        close(in_p[1]);
-        close(out_p[0]);
-        close(out_p[1]);
-        return -1;
-    }
-
-    if (pid == 0) {
-        dup2(in_p[0], STDIN_FILENO);
-        dup2(out_p[1], STDOUT_FILENO);
-        close(in_p[0]);
-        close(in_p[1]);
-        close(out_p[0]);
-        close(out_p[1]);
-        execlp("curl", "curl", "-s", "-K", "-", (char *)NULL);
-        _exit(127);
-    }
-
-    close(in_p[0]);
-    close(out_p[1]);
-
-    /* Config is small (well under the pipe buffer), so a blocking write is safe. */
-    while (off < cfg->len) {
-        ssize_t w = write(in_p[1], cfg->data + off, cfg->len - off);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            ok = false;
-            break;
-        }
-        off += (size_t)w;
-    }
-    close(in_p[1]);
-
-    for (;;) {
-        ssize_t r = read(out_p[0], chunk, sizeof chunk);
-        if (r < 0) {
-            if (errno == EINTR) {
-                if (g_stop)
-                    break;
-                continue;
-            }
-            ok = false;
-            break;
-        }
-        if (r == 0)
-            break;
-        buf_add(out, chunk, (size_t)r);
-    }
-    close(out_p[0]);
-
-    if (g_stop)
-        kill(pid, SIGTERM);
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-        ;
-
+    r.argv = argv;
+    r.in = cfg->data;
+    r.inlen = cfg->len;
+    r.sink = sink_buf;
+    r.ctx = out;
+    r.stop = &g_stop;
+    rc = plat_run(&r);
     if (out->err)
-        ok = false;
-    return (ok && WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+        return -1;
+    return rc == 0 ? 0 : -1;
 }
 
 /* Builds the endpoint URL for a Bot API method. */
@@ -557,7 +494,7 @@ static bool ip_save(void) {
                 g_ips[i].ip);
     if (fclose(f) != 0)
         return false;
-    return rename(tmp, g_ipfile) == 0;
+    return plat_replace_file(tmp, g_ipfile);
 }
 
 /* Validates and canonicalises an IPv4 or IPv6 address. */
@@ -688,9 +625,10 @@ static void cmd_status(int64_t chat) {
     char host[256] = "unknown";
     long up = (long)difftime(time(NULL), g_started);
 
-    gethostname(host, sizeof host - 1);
+    if (!plat_hostname(host, sizeof host))
+        snprintf(host, sizeof host, "unknown");
     reply(chat, "Super_RCT %s\nHost: %s\nPID: %ld\nUptime: %ldh %ldm %lds\nIP entries: %d",
-          SRCT_VERSION, host, (long)getpid(), up / 3600, (up % 3600) / 60, up % 60,
+          SRCT_VERSION, host, plat_pid(), up / 3600, (up % 3600) / 60, up % 60,
           g_nips);
 }
 
@@ -820,76 +758,32 @@ static bool split_argv(const char *target, char *store, size_t n, char **argv, i
  * Runs a fixed program (no shell), capturing stdout and stderr up to READ_MAX.
  * Returns the exit status, EXIT_TIMEOUT if killed by the alarm, or -1 on error.
  */
+/* Keeps at most READ_MAX bytes; the rest is read and dropped. */
+static void sink_capped(void *ctx, const char *data, size_t n) {
+    buf_t *out = (buf_t *)ctx;
+    size_t take = n;
+
+    if (out->len >= READ_MAX)
+        return;
+    if (take > READ_MAX - out->len)
+        take = READ_MAX - out->len;
+    buf_add(out, data, take);
+}
+
+/*
+ * Runs a fixed program (no shell), capturing stdout and stderr up to READ_MAX.
+ * Returns the exit status, EXIT_TIMEOUT if killed by the timeout, or -1 on error.
+ */
 static int run_argv_vec(char *const *argv, buf_t *out) {
-    int pfd[2];
-    pid_t pid;
-    int status = 0;
-    char chunk[4096];
+    plat_run_t r = {0};
 
-    if (pipe(pfd) < 0)
-        return -1;
-
-    pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        static const char missing[] = "command not available on this host\n";
-        int nul = open("/dev/null", O_RDONLY);
-
-        if (nul >= 0) {
-            dup2(nul, STDIN_FILENO);
-            close(nul);
-        }
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[0]);
-        close(pfd[1]);
-        alarm(CMD_TIMEOUT_S);
-        execvp(argv[0], argv);
-        {
-            ssize_t w = write(STDOUT_FILENO, missing, sizeof missing - 1);
-            (void)w; /* best effort: the child exits either way */
-        }
-        _exit(EXIT_NOT_FOUND);
-    }
-
-    close(pfd[1]);
-    for (;;) {
-        ssize_t r = read(pfd[0], chunk, sizeof chunk);
-
-        if (r < 0) {
-            if (errno == EINTR) {
-                if (g_stop)
-                    break;
-                continue;
-            }
-            break;
-        }
-        if (r == 0)
-            break;
-        if (out->len < READ_MAX) {
-            size_t take = (size_t)r;
-
-            if (take > READ_MAX - out->len)
-                take = READ_MAX - out->len;
-            buf_add(out, chunk, take);
-        }
-        /* Beyond READ_MAX we keep draining so the child never blocks. */
-    }
-    close(pfd[0]);
-
-    if (g_stop)
-        kill(pid, SIGTERM);
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-        ;
-    if (WIFSIGNALED(status))
-        return EXIT_TIMEOUT;
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return -1;
+    r.argv = argv;
+    r.timeout_s = CMD_TIMEOUT_S;
+    r.sink = sink_capped;
+    r.ctx = out;
+    r.stop = &g_stop;
+    r.missing_note = true;
+    return plat_run(&r);
 }
 
 static int run_argv(const char *target, buf_t *out) {
@@ -901,115 +795,22 @@ static int run_argv(const char *target, buf_t *out) {
     return run_argv_vec(argv, out);
 }
 
-static double mono_seconds(void) {
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-
 /*
- * Runs `cmd` with /bin/sh -c in its own process group (for /run). Output is kept up
- * to READ_MAX bytes and the rest is drained. If the command, or a background child
- * that still holds the output pipe, outlives `timeout_s`, the whole group is killed
- * and EXIT_TIMEOUT is returned. Returns -1 on a local error.
+ * Runs `cmd` through the shell (/bin/sh on POSIX, cmd.exe on Windows) in its own
+ * process group or job (for /run). Output is kept up to READ_MAX bytes and the
+ * rest is drained. If the command, or a child that still holds the output,
+ * outlives `timeout_s`, the whole tree is killed and EXIT_TIMEOUT is returned.
+ * Returns -1 on a local error.
  */
 static int run_shell_cmd(const char *cmd, int timeout_s, buf_t *out) {
-    int pfd[2];
-    pid_t pid;
-    int status = 0;
-    int exited = 0, eof = 0, killed = 0;
-    double deadline;
-    char chunk[4096];
+    plat_run_t r = {0};
 
-    if (pipe(pfd) < 0)
-        return -1;
-    pid = fork();
-    if (pid < 0) {
-        close(pfd[0]);
-        close(pfd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        int nul = open("/dev/null", O_RDONLY);
-
-        if (nul >= 0) {
-            dup2(nul, STDIN_FILENO);
-            close(nul);
-        }
-        dup2(pfd[1], STDOUT_FILENO);
-        dup2(pfd[1], STDERR_FILENO);
-        close(pfd[0]);
-        close(pfd[1]);
-        setpgid(0, 0);
-        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(EXIT_NOT_FOUND);
-    }
-    setpgid(pid, pid); /* also in the parent, so the group exists before any kill */
-    close(pfd[1]);
-
-    deadline = mono_seconds() + timeout_s;
-    while (!(eof && exited)) {
-        struct pollfd pf;
-        double left = deadline - mono_seconds();
-        int wait_ms;
-
-        if (!exited && waitpid(pid, &status, WNOHANG) == pid)
-            exited = 1;
-        if (left <= 0 || g_stop) {
-            kill(-pid, SIGKILL);
-            killed = 1;
-            break;
-        }
-        if (eof) { /* output closed, waiting for the child to exit */
-            struct timespec nap = {0, 50000000};
-
-            nanosleep(&nap, NULL);
-            continue;
-        }
-        pf.fd = pfd[0];
-        pf.events = POLLIN;
-        pf.revents = 0;
-        wait_ms = (int)(left * 1000.0);
-        if (wait_ms > 200)
-            wait_ms = 200;
-        if (wait_ms < 1)
-            wait_ms = 1;
-        if (poll(&pf, 1, wait_ms) < 0) {
-            if (errno == EINTR)
-                continue;
-            break;
-        }
-        if (pf.revents & (POLLIN | POLLHUP | POLLERR)) {
-            ssize_t r = read(pfd[0], chunk, sizeof chunk);
-
-            if (r < 0 && errno == EINTR)
-                continue;
-            if (r <= 0) {
-                eof = 1;
-            } else if (out->len < READ_MAX) {
-                size_t take = (size_t)r;
-
-                if (take > READ_MAX - out->len)
-                    take = READ_MAX - out->len;
-                buf_add(out, chunk, take);
-            }
-        }
-    }
-    close(pfd[0]);
-    if (!exited) {
-        if (!killed) {
-            kill(-pid, SIGKILL); /* poll failed; do not leave the child behind */
-            killed = 1;
-        }
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
-            ;
-    }
-    if (killed)
-        return EXIT_TIMEOUT;
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return -1;
+    r.cmd = cmd;
+    r.timeout_s = timeout_s;
+    r.sink = sink_capped;
+    r.ctx = out;
+    r.stop = &g_stop;
+    return plat_run(&r);
 }
 
 /* Reads at most READ_MAX bytes of a fixed file. Returns false if unreadable. */
@@ -1276,7 +1077,7 @@ static bool handle_response(const char *json) {
 
 static void sleep_interruptible(unsigned seconds) {
     while (seconds-- > 0 && !g_stop)
-        sleep(1);
+        plat_sleep_ms(1000);
 }
 
 static bool valid_token(const char *t) {
@@ -1564,8 +1365,6 @@ static void usage(FILE *out) {
 }
 
 int main(int argc, char **argv) {
-    struct sigaction sa;
-
     if (argc > 1) {
         if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
             usage(stdout);
@@ -1584,12 +1383,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
+    plat_catch_stop(on_signal);
 
     g_started = time(NULL);
     ip_load();
