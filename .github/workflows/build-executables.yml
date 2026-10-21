@@ -6,7 +6,7 @@
 #
 #   Linux    super_rct-<protocol>-c, super_rct-<protocol>-nuitka, super_rct-both-installers
 #   macOS    super_rct-<protocol>-c, super_rct-<protocol>-nuitka
-#   Windows  super_rct-<protocol>-nuitka.exe (C needs POSIX, so no Windows C build yet)
+#   Windows  super_rct-<protocol>-c.exe, super_rct-<protocol>-nuitka.exe
 #
 # Runs on: manual start (Actions tab), pushes to main and arena/** branches,
 # pull requests to main, and version tags (v*). Tags also publish a GitHub
@@ -42,7 +42,7 @@ jobs:
             protocols: "telegram discord"
             tag: macos
           - os: windows-latest
-            targets: "py-nuitka"
+            targets: "c py-nuitka"
             protocols: "telegram discord"
             tag: windows
     steps:
@@ -55,6 +55,11 @@ jobs:
       - name: Install Nuitka
         if: contains(matrix.targets, 'py-nuitka')
         run: python -m pip install --upgrade pip nuitka ordered-set zstandard
+
+      # The Windows C build uses ziglang's bundled C compiler (no MinGW on the runner).
+      - name: Install ziglang (Windows C compiler)
+        if: runner.os == 'Windows' && contains(matrix.targets, 'c')
+        run: python -m pip install --upgrade pip ziglang
 
       # Each part is its own step so a failure shows up by name in the run summary.
       - name: Builder tests - arguments, dry runs, wizard, refusals, protocols

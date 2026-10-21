@@ -6,7 +6,7 @@ Remote Control Tool via Telegram and Discord, with an IP address registry
 Super_RCT is a small Telegram bot with two interchangeable implementations that
 share the same commands, replies and configuration:
 
-- `src/super_rct.c`: C, POSIX. The release binary is about 28 KB.
+- `src/super_rct.c`: C, for Linux, macOS, BSD and Windows. The Linux release binary is about 28 KB.
 - `src/super_rct.py`: Python 3.8+, standard library only.
 
 Both long-poll the Telegram Bot API, only talk to chats you list, and require a
@@ -125,6 +125,10 @@ Every chat must first send `/auth <password>`. Then:
 
 Requirements: a C11 compiler, `make`, a POSIX system (Linux, macOS, BSD), and
 the `curl` command-line tool (used for HTTPS).
+
+On Windows, build with `tools/builder.py --target c` (see below). It needs MinGW
+gcc on PATH, or `pip install ziglang`, which bundles a C compiler. Windows 10 and
+later include `curl.exe`.
 
 ```sh
 make            # debug-friendly build -> build/super_rct

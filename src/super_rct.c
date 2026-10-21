@@ -10,7 +10,7 @@
  *   - Keeps an IP registry (enabled/disabled) in a plain text file.
  *
  * Design notes
- *   - POSIX only (Linux, macOS, BSD). No runtime libraries besides libc.
+ *   - Linux, macOS, BSD and Windows. Only libc, plus ws2_32 and iphlpapi on Windows.
  *   - HTTPS is delegated to the system `curl` executable. Requests are
  *     passed to curl through its config-file interface on stdin, so the
  *     bot token and password never appear in the process list.
@@ -33,7 +33,9 @@
 /* macOS hides some declarations (e.g. _SC_NPROCESSORS_ONLN, BSD types) unless this is set. */
 #define _DARWIN_C_SOURCE 1
 #endif
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <errno.h>
 #include <inttypes.h>

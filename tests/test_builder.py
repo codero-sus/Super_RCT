@@ -105,18 +105,40 @@ class WizardTests(unittest.TestCase):
 
 
 class PlatformRefusalTests(unittest.TestCase):
-    """On Windows the C bot and the installers are refused with a clear reason."""
+    """Installers are refused off Linux; the C bot is built for Windows with gcc or ziglang."""
 
-    def test_c_and_installers_refused_on_windows(self):
+    def test_installers_refused_on_windows(self):
         out = tempfile.mkdtemp(prefix="srct-win-")
         try:
-            for target, needle in (("c", "POSIX"), ("installers", "Linux")):
-                with self.subTest(target=target), \
-                        mock.patch.object(builder.sys, "platform", "win32"):
-                    code, _, err = run_main(["--target", target, "--out", out])
-                    self.assertEqual(code, 1)
-                    self.assertIn(needle, err)
+            with mock.patch.object(builder.sys, "platform", "win32"):
+                code, _, err = run_main(["--target", "installers", "--out", out])
+                self.assertEqual(code, 1)
+                self.assertIn("Linux", err)
             self.assertFalse(os.path.exists(os.path.join(out, "super_rct")))
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+    def test_windows_c_dry_run_links_winsock_and_iphlpapi(self):
+        with mock.patch.object(builder.sys, "platform", "win32"), \
+                mock.patch.object(builder, "windows_c_compiler", return_value=["gcc"]):
+            plan = builder.Plan(target="c", out_dir=Path("/tmp/none"), name="super_rct-discord-c",
+                                dry_run=True, protocol="discord")
+            argv = next(step.run[0] for step in builder.build_steps(plan)
+                        if isinstance(step.run, tuple))
+        self.assertIn("-lws2_32", argv)
+        self.assertIn("-liphlpapi", argv)
+        self.assertIn("-DSRCT_PROTOCOL=2", argv)
+        self.assertTrue(str(argv[argv.index("-o") + 1]).endswith("super_rct-discord-c.exe"))
+
+    def test_windows_c_without_compiler_is_a_clear_error(self):
+        out = tempfile.mkdtemp(prefix="srct-win-")
+        try:
+            with mock.patch.object(builder.sys, "platform", "win32"), \
+                    mock.patch.object(builder, "windows_c_compiler", return_value=None):
+                code, _, err = run_main(["--target", "c", "--out", out])
+            self.assertEqual(code, 1)
+            self.assertIn("C compiler", err)
+            self.assertIn("ziglang", err)
         finally:
             shutil.rmtree(out, ignore_errors=True)
 
