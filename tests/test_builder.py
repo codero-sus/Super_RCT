@@ -100,7 +100,10 @@ class WizardTests(unittest.TestCase):
         self.assertIn("Enter a number from 1 to", text)
         self.assertIn("bad name", text)
         self.assertIn("Dry run", text)
-        self.assertIn("Copy the binary to", text)
+        if builder.sys.platform == "win32":
+            self.assertIn("Compile the C bot for Windows", text)  # writes tool.exe directly
+        else:
+            self.assertIn("Copy the binary to", text)
         self.assertIn("tool", text)
 
 
