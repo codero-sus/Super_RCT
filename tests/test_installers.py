@@ -92,7 +92,7 @@ class CInstallerTests(InstallerCases, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.installer = [os.path.join(INSTALLERS, "super_rct-linux")]
+        cls.installer = [os.path.join(INSTALLERS, "super_rct-telegram-linux")]
         cls.bot = ["./super_rct"]
 
 
@@ -100,8 +100,20 @@ class PythonInstallerTests(InstallerCases, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.installer = [sys.executable, os.path.join(INSTALLERS, "super_rct-linux.py")]
+        cls.installer = [sys.executable, os.path.join(INSTALLERS, "super_rct-telegram-linux.py")]
         cls.bot = [sys.executable, "super_rct.py"]
+
+
+class OneInstallerPerProtocolTests(unittest.TestCase):
+    """Each protocol has its own installer, in C and in Python."""
+
+    def test_both_protocols_have_both_languages(self):
+        subprocess.run([sys.executable, os.path.join(ROOT, "tools", "build_installers.py")],
+                       check=True, capture_output=True)
+        for protocol in ("telegram", "discord"):
+            for name in (f"super_rct-{protocol}-linux", f"super_rct-{protocol}-linux.py"):
+                with self.subTest(name=name):
+                    self.assertTrue(os.path.isfile(os.path.join(INSTALLERS, name)), name)
 
 
 if __name__ == "__main__":

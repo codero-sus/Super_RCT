@@ -39,11 +39,18 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): $(SRC) $(DEPS) | $(BUILD)
+# The stamp records which protocol the binary was built for. Changing PROTOCOL
+# rewrites it, which forces `make all` to rebuild the binary for that protocol.
+$(BUILD)/protocol.txt: FORCE | $(BUILD)
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(PROTOCOL)" ]; then echo $(PROTOCOL) > $@; fi
+
+FORCE:
+
+$(TARGET): $(SRC) $(DEPS) $(BUILD)/protocol.txt | $(BUILD)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
 
 # Smallest binary: stripped, size-optimised, dead code removed.
-release: $(SRC) $(DEPS) | $(BUILD)
+release: $(SRC) $(DEPS) $(BUILD)/protocol.txt | $(BUILD)
 	$(CC) -std=c11 $(RELFLAGS) -Wall -Wextra -Wpedantic -DSRCT_PROTOCOL=$(PROTO_ID) $(LDFLAGS) $(RELLDFLAGS) -o $(TARGET) $(SRC)
 
 $(BUILD):
@@ -53,11 +60,14 @@ $(BUILD):
 # (make -j); -O keeps each target's output together. `all` is built once,
 # first, by `test`, so the parallel targets never rebuild the binary at the same time.
 TEST_JOBS ?= 4
+# The installer and builder suites run `make release` for other protocols, which
+# overwrites build/super_rct. The C bot tests therefore use a private copy.
 test: all
+	mkdir -p $(BUILD)/test && cp $(TARGET) $(BUILD)/test/super_rct
 	$(MAKE) -j$(TEST_JOBS) -O test-bot-c test-bot-py test-bot-table test-installers test-builders test-update
 
 test-bot-c:
-	python3 tests/test_super_rct.py CBotTests
+	SUPER_RCT_BINARY=$(CURDIR)/$(BUILD)/test/super_rct python3 tests/test_super_rct.py CBotTests
 
 test-bot-py:
 	python3 tests/test_super_rct.py PythonBotTests

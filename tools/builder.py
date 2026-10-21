@@ -97,7 +97,7 @@ def c_copy_step(plan):
 
 def installers_step(plan):
     plan.out_dir.mkdir(parents=True, exist_ok=True)
-    for built in (ROOT / "build" / "installers").glob("super_rct-linux*"):
+    for built in (ROOT / "build" / "installers").glob("super_rct-*-linux*"):
         shutil.copy2(built, plan.out_dir / built.name)
 
 
@@ -130,8 +130,9 @@ def build_steps(plan):
     if plan.target == "installers":
         if sys.platform != "linux":
             plan.notes.append("The installers are for Linux; build them on Linux.")
-        return [Step("Build the Linux installers (tools/build_installers.py)",
-                     ([sys.executable, str(ROOT / "tools" / "build_installers.py")], ROOT)),
+        return [Step(f"Build the Linux installers for {plan.protocol} (tools/build_installers.py)",
+                     ([sys.executable, str(ROOT / "tools" / "build_installers.py"),
+                       "--protocol", plan.protocol], ROOT)),
                 Step(f"Copy them to {plan.out_dir}", installers_step)]
     raise BuildError(f"unknown target {plan.target!r}")
 
