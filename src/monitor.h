@@ -8,9 +8,15 @@
  * or captures the screen, keyboard or camera.
  */
 
-#include <dirent.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <iphlpapi.h>
+#include <tlhelp32.h>
+#include <winreg.h>
+#else
+#include <dirent.h>
 #include <sys/statvfs.h>
+#endif
 
 #define METRIC_MEM 0
 #define METRIC_DISK 1
@@ -109,7 +115,7 @@ static void reply_buf(int64_t chat, buf_t *b) {
 static void fmt_clock(time_t t, char *out, size_t n) {
     struct tm tmv;
 
-    localtime_r(&t, &tmv);
+    plat_localtime(t, &tmv);
     strftime(out, n, "%H:%M", &tmv);
 }
 
@@ -120,8 +126,211 @@ static void fmt_duration(double secs, char *out, size_t n) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Helpers shared by both platforms. */
+#ifdef _WIN32
+static bool host_stats_readable(void) {
+    MEMORYSTATUSEX ms;
+
+    memset(&ms, 0, sizeof ms);
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) != 0;
+}
+
+static bool disk_stats_ok(void) {
+    ULARGE_INTEGER avail;
+    ULARGE_INTEGER total;
+    ULARGE_INTEGER freeb;
+
+    return GetDiskFreeSpaceExA("C:\\", &avail, &total, &freeb) != 0;
+}
+
+static bool reboot_required(void) {
+    HKEY key;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+                      "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired",
+                      0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    RegCloseKey(key);
+    return true;
+}
+#else
+static bool host_stats_readable(void) {
+    return access("/proc/meminfo", R_OK) == 0;
+}
+
+static bool disk_stats_ok(void) {
+    struct statvfs sv;
+
+    return statvfs("/", &sv) == 0;
+}
+
+static bool reboot_required(void) {
+    return access("/var/run/reboot-required", F_OK) == 0;
+}
+#endif
+
 /* Readers for /proc and /sys                                                */
 /* ------------------------------------------------------------------------- */
+
+#ifdef _WIN32
+
+static unsigned long long win_filetime(const FILETIME *ft) {
+    return ((unsigned long long)ft->dwHighDateTime << 32) | (unsigned long long)ft->dwLowDateTime;
+}
+
+static bool read_meminfo(double *mem_pct, double *swap_pct, long *mem_total_mb,
+                         long *mem_used_mb, long *swap_total_mb, long *swap_used_mb) {
+    MEMORYSTATUSEX ms;
+    unsigned long long phys_used;
+    unsigned long long swap_total;
+    unsigned long long swap_used;
+
+    memset(&ms, 0, sizeof ms);
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms) || ms.ullTotalPhys == 0)
+        return false;
+    phys_used = ms.ullTotalPhys - ms.ullAvailPhys;
+    *mem_total_mb = (long)(ms.ullTotalPhys / 1048576ULL);
+    *mem_used_mb = (long)(phys_used / 1048576ULL);
+    *mem_pct = 100.0 * (double)phys_used / (double)ms.ullTotalPhys;
+    /* The page file total includes physical memory, so swap is the difference. */
+    swap_total = ms.ullTotalPageFile > ms.ullTotalPhys ? ms.ullTotalPageFile - ms.ullTotalPhys : 0;
+    swap_used = (ms.ullTotalPageFile - ms.ullAvailPageFile) > phys_used
+                    ? (ms.ullTotalPageFile - ms.ullAvailPageFile) - phys_used
+                    : 0;
+    if (swap_used > swap_total)
+        swap_used = swap_total;
+    *swap_total_mb = (long)(swap_total / 1048576ULL);
+    *swap_used_mb = (long)(swap_used / 1048576ULL);
+    *swap_pct = swap_total > 0 ? 100.0 * (double)swap_used / (double)swap_total : 0.0;
+    return true;
+}
+
+static bool read_load(double *l1, double *l5, double *l15) {
+    /* Windows has no load average. */
+    (void)l1;
+    (void)l5;
+    (void)l15;
+    return false;
+}
+
+static long ncpus(void) {
+    SYSTEM_INFO si;
+
+    GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0 ? (long)si.dwNumberOfProcessors : 1;
+}
+
+static bool read_temp_c(double *out) {
+    /* Temperatures need WMI or a vendor driver; not read on Windows yet. */
+    (void)out;
+    return false;
+}
+
+static bool read_cpu(unsigned long long *busy, unsigned long long *total) {
+    FILETIME idle;
+    FILETIME kern;
+    FILETIME user;
+    unsigned long long i;
+    unsigned long long k;
+    unsigned long long u;
+
+    if (!GetSystemTimes(&idle, &kern, &user))
+        return false;
+    i = win_filetime(&idle);
+    k = win_filetime(&kern);
+    u = win_filetime(&user);
+    *total = k + u; /* kernel time already includes idle time */
+    *busy = *total - i;
+    return *total > 0;
+}
+
+static bool net_bytes(unsigned long long *rx, unsigned long long *tx) {
+    MIB_IF_TABLE2 *table = NULL;
+    unsigned long long r = 0;
+    unsigned long long t = 0;
+    bool any = false;
+
+    if (GetIfTable2(&table) != NO_ERROR || table == NULL)
+        return false;
+    for (ULONG i = 0; i < table->NumEntries; i++) {
+        const MIB_IF_ROW2 *row = &table->Table[i];
+
+        if (row->Type == IF_TYPE_SOFTWARE_LOOPBACK || row->OperStatus != IfOperStatusUp)
+            continue;
+        r += row->InOctets;
+        t += row->OutOctets;
+        any = true;
+    }
+    FreeMibTable(table);
+    *rx = r;
+    *tx = t;
+    return any;
+}
+
+static bool read_uptime(double *secs) {
+    *secs = (double)GetTickCount64() / 1000.0;
+    return true;
+}
+
+static int count_procs(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32 pe;
+    int n = 0;
+
+    if (snap == INVALID_HANDLE_VALUE)
+        return -1;
+    memset(&pe, 0, sizeof pe);
+    pe.dwSize = sizeof pe;
+    if (Process32First(snap, &pe)) {
+        do {
+            n++;
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+/* Usage of every fixed drive, like df. */
+static int disk_scan(disk_t *out, int max) {
+    DWORD mask = GetLogicalDrives();
+    int n = 0;
+
+    for (int i = 0; i < 26 && n < max; i++) {
+        char root[4];
+        char fs[64] = "";
+        ULARGE_INTEGER avail;
+        ULARGE_INTEGER total;
+        ULARGE_INTEGER freeb;
+        double used;
+        double av;
+
+        if (!(mask & (1UL << i)))
+            continue;
+        root[0] = (char)('A' + i);
+        root[1] = ':';
+        root[2] = '\\';
+        root[3] = '\0';
+        if (GetDriveTypeA(root) != DRIVE_FIXED)
+            continue;
+        if (!GetVolumeInformationA(root, NULL, 0, NULL, NULL, NULL, fs, (DWORD)sizeof fs))
+            continue;
+        if (!GetDiskFreeSpaceExA(root, &avail, &total, &freeb) || total.QuadPart == 0)
+            continue;
+        used = (double)(total.QuadPart - freeb.QuadPart);
+        av = (double)avail.QuadPart;
+        if (used + av <= 0)
+            continue;
+        snprintf(out[n].mount, sizeof out[n].mount, "%s", root);
+        snprintf(out[n].fstype, sizeof out[n].fstype, "%s", fs);
+        out[n].pct = 100.0 * used / (used + av);
+        n++;
+    }
+    return n;
+}
+
+#else
 
 static bool read_meminfo(double *mem_pct, double *swap_pct, long *mem_total_mb,
                          long *mem_used_mb, long *swap_total_mb, long *swap_used_mb) {
@@ -224,21 +433,6 @@ static bool read_cpu(unsigned long long *busy, unsigned long long *total) {
         return false;
     *total = u + ni + sy + id + io + irq + sirq + st;
     *busy = *total - id - io;
-    return true;
-}
-
-static bool cpu_busy_pct(int seconds, double *pct) {
-    unsigned long long b1;
-    unsigned long long t1;
-    unsigned long long b2;
-    unsigned long long t2;
-
-    if (!read_cpu(&b1, &t1))
-        return false;
-    sleep((unsigned)seconds);
-    if (!read_cpu(&b2, &t2) || t2 <= t1)
-        return false;
-    *pct = 100.0 * (double)(b2 - b1) / (double)(t2 - t1);
     return true;
 }
 
@@ -377,6 +571,23 @@ static int disk_scan(disk_t *out, int max) {
     return n;
 }
 
+#endif
+
+static bool cpu_busy_pct(int seconds, double *pct) {
+    unsigned long long b1;
+    unsigned long long t1;
+    unsigned long long b2;
+    unsigned long long t2;
+
+    if (!read_cpu(&b1, &t1))
+        return false;
+    plat_sleep_ms(seconds * 1000);
+    if (!read_cpu(&b2, &t2) || t2 <= t1)
+        return false;
+    *pct = 100.0 * (double)(b2 - b1) / (double)(t2 - t1);
+    return true;
+}
+
 /* Runs a fixed program and returns true on exit status 0. */
 static bool capture_ok(char *const *argv, buf_t *out) {
     return run_argv_vec(argv, out) == 0;
@@ -459,7 +670,7 @@ static time_t next_daily(time_t now, int minute_of_day) {
     struct tm lt;
     time_t nxt;
 
-    if (!localtime_r(&now, &lt))
+    if (!plat_localtime(now, &lt))
         return now + 86400;
     lt.tm_hour = 0;
     lt.tm_min = 0;
@@ -476,7 +687,7 @@ static bool in_quiet_hours(const chat_state *c, time_t now) {
     struct tm lt;
     int hour;
 
-    if (c->quiet_start < 0 || !localtime_r(&now, &lt))
+    if (c->quiet_start < 0 || !plat_localtime(now, &lt))
         return false;
     hour = lt.tm_hour;
     if (c->quiet_start < c->quiet_end)
@@ -618,7 +829,7 @@ static void build_health(buf_t *b) {
     else
         bappendf(b, "Updates available: n/a\n");
     bappendf(b, "Reboot required: %s\n",
-             access("/var/run/reboot-required", F_OK) == 0 ? "yes" : "no");
+             reboot_required() ? "yes" : "no");
 }
 
 static void send_health(int64_t chat) {
@@ -641,6 +852,13 @@ static const char *grade(double v, double warn, double fail) {
     return "OK";
 }
 
+#ifdef _WIN32
+static bool read_psi_some(const char *name, double *out) {
+    (void)name;
+    (void)out;
+    return false; /* pressure stall information is Linux-only */
+}
+#else
 /* 10-second average of 'some' pressure (percent) from /proc/pressure. */
 static bool read_psi_some(const char *name, double *out) {
     char path[128];
@@ -666,6 +884,8 @@ static bool read_psi_some(const char *name, double *out) {
     fclose(f);
     return found;
 }
+#endif
+
 
 static void diag_line(buf_t *b, int *warnings, int *failures, const char *level,
                       const char *text) {
@@ -748,7 +968,7 @@ static void build_diagnose(buf_t *b) {
     }
     free(out.data);
     out = (buf_t){0};
-    if (access("/var/run/reboot-required", F_OK) == 0)
+    if (reboot_required())
         diag_line(b, &warnings, &failures, "WARN", "Reboot required");
     if (capture_ok(ua, &out)) {
         int updates = count_lines(&out, "[upgradable");
@@ -895,7 +1115,7 @@ static void cmd_net_rate(int64_t chat) {
         reply(chat, "Network statistics are not available on this host.");
         return;
     }
-    sleep(1);
+    plat_sleep_ms(1000);
     if (!net_bytes(&r2, &t2)) {
         reply(chat, "Network statistics are not available on this host.");
         return;
@@ -926,6 +1146,10 @@ static void cmd_uptime_h(int64_t chat) {
 }
 
 static void cmd_failed_units(int64_t chat) {
+#ifdef _WIN32
+    reply(chat, "Failed-unit checks use systemd, which this Windows build does not have.");
+    return;
+#endif
     char *argv[] = {"systemctl", "--failed", "--no-legend", "--plain", NULL};
     buf_t out = {0};
     int status = run_argv_vec(argv, &out);
@@ -945,6 +1169,10 @@ static void cmd_failed_units(int64_t chat) {
 }
 
 static void cmd_updates_count(int64_t chat) {
+#ifdef _WIN32
+    reply(chat, "Package update checks use apt, which this Windows build does not have.");
+    return;
+#endif
     char *argv[] = {"apt", "list", "--upgradable", NULL};
     buf_t out = {0};
 
@@ -957,7 +1185,7 @@ static void cmd_updates_count(int64_t chat) {
 
 static void cmd_reboot_required(int64_t chat) {
     reply(chat, "Reboot required: %s",
-          access("/var/run/reboot-required", F_OK) == 0 ? "yes" : "no");
+          reboot_required() ? "yes" : "no");
 }
 
 #define STATE_HEADER \
@@ -1093,10 +1321,10 @@ static bool save_state(void) {
         fprintf(f, " %ld %d %d %d %d\n", (long)(c->report_every / 60), c->cooldown_min,
                 c->quiet_start, c->quiet_end, c->daily_at);
     }
-    ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fflush(f) == 0 && plat_fsync(f);
     if (fclose(f) != 0)
         ok = false;
-    if (!ok || rename(tmp, g_statefile) != 0) {
+    if (!ok || !plat_replace_file(tmp, g_statefile)) {
         unlink(tmp);
         return false;
     }
@@ -1506,11 +1734,8 @@ static void cmd_selftest(int64_t chat) {
     buf_t tmp = {0};
 
     bappendf(&b, "Config: OK\n");
-    bappendf(&b, "/proc readable: %s\n", access("/proc/meminfo", R_OK) == 0 ? "PASS" : "FAIL");
-    {
-        struct statvfs sv;
-        bappendf(&b, "Disk statistics: %s\n", statvfs("/", &sv) == 0 ? "PASS" : "FAIL");
-    }
+    bappendf(&b, "Host statistics readable: %s\n", host_stats_readable() ? "PASS" : "FAIL");
+    bappendf(&b, "Disk statistics: %s\n", disk_stats_ok() ? "PASS" : "FAIL");
     if (slash) {
         size_t n = (size_t)(slash - g_ipfile);
         if (n == 0)

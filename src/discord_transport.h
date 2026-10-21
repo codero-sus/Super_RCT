@@ -94,7 +94,7 @@ static int discord_call(const char *method, const char *path, const char *body, 
                 secs = 0;
             if (secs > 30)
                 secs = 30;
-            sleep((unsigned)secs + 1);
+            plat_sleep_ms(((int)secs + 1) * 1000);
         }
     }
     return rc;

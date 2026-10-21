@@ -1,0 +1,30 @@
+# Super_RCT Windows command table. Read by tools/gen_commands.py together with
+# src/commands.def (regenerate with: python3 tools/gen_commands.py).
+#
+# Same format as commands.def. Only 'f' (file) and 'c' (program) entries here;
+# built-ins are shared. Paths use drive letters. Program arguments are plain
+# words (no shell): they are split on spaces and run directly, never through cmd.exe.
+win_hosts|f|C:\Windows\System32\drivers\etc\hosts|Hosts file
+win_networks|f|C:\Windows\System32\drivers\etc\networks|Network name file
+win_win_ini|f|C:\Windows\win.ini|Windows settings file (win.ini)
+win_ipconfig|c|ipconfig /all|IP configuration of all adapters
+win_dns_cache|c|ipconfig /displaydns|DNS resolver cache
+win_netstat|c|netstat -an|Listening and connected sockets
+win_netstat_pid|c|netstat -ano|Sockets with owning process IDs
+win_route|c|route print|Routing table
+win_arp|c|arp -a|ARP cache
+win_getmac|c|getmac /v /fo list|MAC addresses and transports
+win_netsh_wlan|c|netsh wlan show interfaces|Wi-Fi interface status
+win_firewall|c|netsh advfirewall show allprofiles|Firewall profile state
+win_tasklist|c|tasklist|Running processes
+win_tasklist_svc|c|tasklist /svc|Processes with their services
+win_systeminfo|c|systeminfo|Full system information
+win_driverquery|c|driverquery|Installed device drivers
+win_pnp|c|pnputil /enum-devices /connected|Connected devices (PnP)
+win_services|c|sc query type= service state= all|All Windows services and states
+win_schtasks|c|schtasks /query /fo list|Scheduled tasks
+win_time|c|w32tm /query /status|Windows time sync status
+win_powercfg|c|powercfg /a|Sleep states supported
+win_drives|c|fsutil fsinfo drives|Drive letters
+win_volumes|c|mountvol|Mounted volumes
+win_hostname|c|hostname|Computer name
