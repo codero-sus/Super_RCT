@@ -20,7 +20,8 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "installers")
-PY_BUNDLE = ["super_rct.py", "monitor.py", "discord_transport.py", "commands_table.py"]
+PY_BUNDLE = ["super_rct.py", "monitor.py", "discord_transport.py", "commands_table.py",
+             "build_protocol.py"]
 
 
 def python_installer():

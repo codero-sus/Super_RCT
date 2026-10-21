@@ -10,6 +10,7 @@ it, and checks the replies the bot sends.
 """
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -933,6 +934,102 @@ class GeneratedTableTests(unittest.TestCase):
         res = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "gen_commands.py"),
                               "--check"], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+
+# -- one protocol per build -------------------------------------------------
+
+PROTOCOL_IDS = {"telegram": 1, "discord": 2}
+PY_BOT_FILES = ("super_rct.py", "monitor.py", "commands_table.py", "discord_transport.py")
+
+
+def build_c_variant(protocol, out_dir):
+    """Compiles the C bot for one protocol (same flag the Makefile passes)."""
+    out = os.path.join(out_dir, f"srct_{protocol}")
+    subprocess.run(["cc", "-std=c11", "-O2", f"-DSRCT_PROTOCOL={PROTOCOL_IDS[protocol]}",
+                    "-o", out, os.path.join(ROOT, "src", "super_rct.c")],
+                   check=True, capture_output=True)
+    return [out]
+
+
+def build_py_variant(protocol, out_dir):
+    """Copies the Python bot with build_protocol.py set, as the builder does."""
+    dest = os.path.join(out_dir, f"py_{protocol}")
+    os.makedirs(dest)
+    for name in PY_BOT_FILES:
+        shutil.copy2(os.path.join(ROOT, "src", name), dest)
+    with open(os.path.join(dest, "build_protocol.py"), "w", encoding="utf-8") as f:
+        f.write(f'PROTOCOL = "{protocol}"\n')
+    return [sys.executable, os.path.join(dest, "super_rct.py")]
+
+
+class ProtocolVariantTests(unittest.TestCase):
+    """Each build serves one protocol and refuses the other protocol's settings."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp(prefix="srct-variants-")
+        cls.commands = {}
+        for proto in ("telegram", "discord"):
+            cls.commands[("c", proto)] = build_c_variant(proto, cls.dir)
+            cls.commands[("py", proto)] = build_py_variant(proto, cls.dir)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    def test_telegram_build_refuses_discord_settings(self):
+        for lang in ("c", "py"):
+            with self.subTest(lang=lang):
+                res = subprocess.run(
+                    self.commands[(lang, "telegram")],
+                    env=base_env(SUPER_RCT_DISCORD_TOKEN=DISCORD_TOKEN,
+                                 SUPER_RCT_DISCORD_CHANNEL_IDS=str(DISCORD_CHANNEL)),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("not used by the Telegram build", res.stderr)
+
+    def test_discord_build_refuses_telegram_settings(self):
+        for lang in ("c", "py"):
+            with self.subTest(lang=lang):
+                res = subprocess.run(
+                    self.commands[(lang, "discord")],
+                    env=base_env(SUPER_RCT_DISCORD_TOKEN=DISCORD_TOKEN,
+                                 SUPER_RCT_DISCORD_CHANNEL_IDS=str(DISCORD_CHANNEL)),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("not used by the Discord build", res.stderr)  # SUPER_RCT_TOKEN
+
+    def test_discord_build_needs_a_discord_token(self):
+        for lang in ("c", "py"):
+            with self.subTest(lang=lang):
+                res = subprocess.run(
+                    self.commands[(lang, "discord")],
+                    env=base_env(SUPER_RCT_TOKEN=None, SUPER_RCT_CHAT_IDS=None),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("SUPER_RCT_DISCORD_TOKEN is required", res.stderr)
+
+    def test_discord_build_runs_without_telegram(self):
+        for lang in ("c", "py"):
+            with self.subTest(lang=lang), MockDiscord({DISCORD_CHANNEL: []}) as dc:
+                tmp = tempfile.mkdtemp()
+                env = base_env(SUPER_RCT_TOKEN=None, SUPER_RCT_CHAT_IDS=None,
+                               SUPER_RCT_DISCORD_TOKEN=DISCORD_TOKEN,
+                               SUPER_RCT_DISCORD_CHANNEL_IDS=str(DISCORD_CHANNEL),
+                               SUPER_RCT_DISCORD_API=dc.url,
+                               SUPER_RCT_IP_FILE=os.path.join(tmp, "ips.txt"),
+                               SUPER_RCT_STATE_FILE=os.path.join(tmp, "state.txt"))
+                proc = subprocess.Popen(self.commands[(lang, "discord")], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True)
+                time.sleep(2.5)  # long enough for a few Discord polls
+                proc.send_signal(signal.SIGTERM)
+                out, err = proc.communicate(timeout=10)
+                text = out + err
+                self.assertEqual(proc.returncode, 0, text)
+                self.assertIn("discord build", text)
+                self.assertNotIn("getUpdates", text)
+                self.assertNotIn("api.telegram.org", text)
 
 
 if __name__ == "__main__":

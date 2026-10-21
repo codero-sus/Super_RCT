@@ -121,6 +121,26 @@ class PlatformRefusalTests(unittest.TestCase):
             shutil.rmtree(out, ignore_errors=True)
 
 
+class ProtocolTests(unittest.TestCase):
+    """The chosen protocol reaches the C build (make flag) and the Python copy."""
+
+    def test_protocol_reaches_make_and_python_stage(self):
+        plan = builder.Plan(target="c", out_dir=Path("/tmp/none"), name="t",
+                            dry_run=True, protocol="discord")
+        argv = next(step.run[0] for step in builder.build_steps(plan)
+                    if isinstance(step.run, tuple))
+        self.assertIn("PROTOCOL=discord", argv)
+        with tempfile.TemporaryDirectory() as tmp:
+            builder.stage_python_sources(Path(tmp), "telegram")
+            text = (Path(tmp) / "build_protocol.py").read_text(encoding="utf-8")
+        self.assertIn('PROTOCOL = "telegram"', text)
+
+    def test_unknown_protocol_is_refused(self):
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(io.StringIO()):
+            run_main(["--target", "c", "--protocol", "bogus", "--dry-run"])
+        self.assertEqual(ctx.exception.code, 2)
+
+
 class RealBuildTests(unittest.TestCase):
     """Builds real artifacts into a temporary folder and runs them."""
 

@@ -9,6 +9,19 @@ CFLAGS  ?= -std=c11 -O2 -g
 CFLAGS  += -Wall -Wextra -Wpedantic -Wshadow -Wformat=2
 LDFLAGS ?=
 
+# Which chat protocol the binary serves: both (default), telegram or discord.
+PROTOCOL ?= both
+ifeq ($(PROTOCOL),both)
+PROTO_ID := 0
+else ifeq ($(PROTOCOL),telegram)
+PROTO_ID := 1
+else ifeq ($(PROTOCOL),discord)
+PROTO_ID := 2
+else
+$(error PROTOCOL must be both, telegram or discord)
+endif
+CFLAGS  += -DSRCT_PROTOCOL=$(PROTO_ID)
+
 BUILD   := build
 TARGET  := $(BUILD)/super_rct
 SRC     := src/super_rct.c
@@ -31,7 +44,7 @@ $(TARGET): $(SRC) $(DEPS) | $(BUILD)
 
 # Smallest binary: stripped, size-optimised, dead code removed.
 release: $(SRC) $(DEPS) | $(BUILD)
-	$(CC) -std=c11 $(RELFLAGS) -Wall -Wextra -Wpedantic $(LDFLAGS) $(RELLDFLAGS) -o $(TARGET) $(SRC)
+	$(CC) -std=c11 $(RELFLAGS) -Wall -Wextra -Wpedantic -DSRCT_PROTOCOL=$(PROTO_ID) $(LDFLAGS) $(RELLDFLAGS) -o $(TARGET) $(SRC)
 
 $(BUILD):
 	mkdir -p $(BUILD)
