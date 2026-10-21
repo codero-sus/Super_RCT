@@ -34,6 +34,7 @@ import urllib.request
 
 from commands_table import COMMANDS
 from discord_transport import DEFAULT_DISCORD_API, Discord, DiscordError
+from build_protocol import PROTOCOL
 from monitor import CMD_TIMEOUT_S, MonitorMixin, load_state
 
 VERSION = "0.5.0"
@@ -123,10 +124,23 @@ def parse_int(text):
         return None
 
 
+USE_TELEGRAM = PROTOCOL != "discord"
+USE_DISCORD = PROTOCOL != "telegram"
+PROTOCOL_NAMES = ("both", "telegram", "discord")
+assert PROTOCOL in PROTOCOL_NAMES, PROTOCOL
+
+
+def wrong_build(setting, build):
+    return ConfigError(f"{setting} is not used by the {build} build; remove it")
+
+
 def load_config(env):
     token = env.get("SUPER_RCT_TOKEN", "")
-    if not valid_token(token):
-        raise ConfigError("SUPER_RCT_TOKEN is missing or malformed")
+    if USE_TELEGRAM:
+        if not valid_token(token):
+            raise ConfigError("SUPER_RCT_TOKEN is missing or malformed")
+    elif token:
+        raise wrong_build("SUPER_RCT_TOKEN", "Discord")
 
     password = env.get("SUPER_RCT_PASSWORD", "")
     if not MIN_PASSWORD <= len(password.encode()) <= MAX_PASSWORD:
@@ -142,17 +156,25 @@ def load_config(env):
         session_s = value
 
     raw_chats = env.get("SUPER_RCT_CHAT_IDS", "")
-    if not raw_chats.strip():
-        raise ConfigError("SUPER_RCT_CHAT_IDS is required (comma-separated)")
     chats = []
-    for part in raw_chats.split(","):
-        value = parse_int(part)
-        if value is None or len(chats) >= MAX_CHATS:
-            raise ConfigError("bad chat id list in SUPER_RCT_CHAT_IDS")
-        chats.append(value)
+    if USE_TELEGRAM:
+        if not raw_chats.strip():
+            raise ConfigError("SUPER_RCT_CHAT_IDS is required (comma-separated)")
+        for part in raw_chats.split(","):
+            value = parse_int(part)
+            if value is None or len(chats) >= MAX_CHATS:
+                raise ConfigError("bad chat id list in SUPER_RCT_CHAT_IDS")
+            chats.append(value)
+    elif raw_chats.strip():
+        raise wrong_build("SUPER_RCT_CHAT_IDS", "Discord")
 
     discord_token = env.get("SUPER_RCT_DISCORD_TOKEN", "")
     discord_chats = []
+    if not USE_DISCORD:
+        if discord_token or env.get("SUPER_RCT_DISCORD_CHANNEL_IDS", "").strip():
+            raise wrong_build("SUPER_RCT_DISCORD_*", "Telegram")
+    elif PROTOCOL == "discord" and not discord_token:
+        raise ConfigError("SUPER_RCT_DISCORD_TOKEN is required in the Discord build")
     if discord_token:
         if not DISCORD_TOKEN_RE.fullmatch(discord_token):
             raise ConfigError("SUPER_RCT_DISCORD_TOKEN is malformed")
@@ -198,6 +220,7 @@ def load_config(env):
         watch_max_h = value
 
     return {
+        "protocol": PROTOCOL,
         "token": token,
         "password": password,
         "session_s": session_s,
@@ -543,6 +566,8 @@ class Bot(MonitorMixin):
             self.handle_message(chat, text)
 
     def poll_once(self):
+        if not USE_TELEGRAM:
+            return
         try:
             # With Discord enabled, keep the Telegram poll short so Discord is checked promptly.
             timeout = 1 if self.discord else POLL_TIMEOUT_S
@@ -575,11 +600,14 @@ class Bot(MonitorMixin):
                 self.handle_message(chat, text)
 
     def run(self):
-        log(f"Super_RCT {VERSION} started ({len(self.chats)} allowed chat(s), "
+        log(f"Super_RCT {VERSION} started ({PROTOCOL} build, {len(self.chats)} allowed chat(s), "
             f"{len(self.registry.entries)} IP entries)")
         try:
             while True:
-                self.poll_once()
+                if USE_TELEGRAM:
+                    self.poll_once()
+                else:
+                    time.sleep(1)  # Discord-only build: no Telegram polling
                 if self.discord and time.time() >= self.next_discord_poll:
                     self.next_discord_poll = time.time() + DISCORD_POLL_S
                     self.poll_discord()

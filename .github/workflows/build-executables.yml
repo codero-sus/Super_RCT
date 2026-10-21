@@ -1,16 +1,16 @@
-# Builds Super_RCT executables on Linux, macOS and Windows with tools/builder.py.
+# Builds Super_RCT executables with tools/builder.py.
 #
-#   Linux    C binary, Python onefile (Nuitka), Linux installers
-#   macOS    C binary, Python onefile (Nuitka)
-#   Windows  Python onefile (Nuitka .exe)
+# One file per protocol (telegram, discord), one file per language (C, Python),
+# one file per operating system. Every file is onefile: it runs without
+# installing Python or any other runtime.
 #
-# Every output is one file that runs without installing Python.
+#   Linux    super_rct-<protocol>-c, super_rct-<protocol>-nuitka, super_rct-both-installers
+#   macOS    super_rct-<protocol>-c, super_rct-<protocol>-nuitka
+#   Windows  super_rct-<protocol>-nuitka.exe (C needs POSIX, so no Windows C build yet)
 #
-# The C bot uses POSIX calls (fork, poll), so there is no Windows C build yet.
-#
-# Runs on: manual start (Actions tab or `gh workflow run`), pushes to main and
-# arena/** branches, pull requests to main, and version tags (v*). Tags also
-# publish a GitHub Release with the executables attached.
+# Runs on: manual start (Actions tab), pushes to main and arena/** branches,
+# pull requests to main, and version tags (v*). Tags also publish a GitHub
+# Release with every executable attached.
 
 name: Build executables
 
@@ -35,12 +35,15 @@ jobs:
         include:
           - os: ubuntu-latest
             targets: "c py-nuitka installers"
+            protocols: "telegram discord"
             tag: linux
           - os: macos-latest
             targets: "c py-nuitka"
+            protocols: "telegram discord"
             tag: macos
           - os: windows-latest
             targets: "py-nuitka"
+            protocols: "telegram discord"
             tag: windows
     steps:
       - uses: actions/checkout@v4
@@ -54,10 +57,10 @@ jobs:
         run: python -m pip install --upgrade pip nuitka ordered-set zstandard
 
       # Each part is its own step so a failure shows up by name in the run summary.
-      - name: Builder tests - arguments, dry runs, wizard, refusals
+      - name: Builder tests - arguments, dry runs, wizard, refusals, protocols
         shell: bash
         working-directory: tests
-        run: python -m unittest test_builder.ArgumentTests test_builder.DryRunTests test_builder.WizardTests test_builder.PlatformRefusalTests -v
+        run: python -m unittest test_builder.ArgumentTests test_builder.DryRunTests test_builder.WizardTests test_builder.PlatformRefusalTests test_builder.ProtocolTests -v
 
       - name: Builder test - the Python target is one onefile executable
         shell: bash
@@ -70,18 +73,21 @@ jobs:
         working-directory: tests
         run: python -m unittest test_builder.RealBuildTests.test_c_binary_runs -v
 
-      - name: Build the targets
+      - name: Build the executables
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           for t in ${{ matrix.targets }}; do
-            case "$t" in
-              c)           name=super_rct-c ;;
-              py-nuitka)   name=super_rct-nuitka ;;
-              installers)  name=super_rct-installers ;;
-            esac
-            python tools/builder.py --target "$t" --out dist --name "$name"
+            if [ "$t" = installers ]; then
+              # Installers embed the shared source; not split by protocol yet.
+              python tools/builder.py --target installers --out dist --name super_rct-both-installers
+              continue
+            fi
+            for p in ${{ matrix.protocols }}; do
+              python tools/builder.py --target "$t" --protocol "$p" --out dist \
+                --name "super_rct-$p-$( [ "$t" = c ] && echo c || echo nuitka )"
+            done
           done
           ls -la dist
 
@@ -89,10 +95,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           found=0
-          for f in dist/super_rct-c dist/super_rct-c.exe \
-                   dist/super_rct-nuitka dist/super_rct-nuitka.exe; do
-            [ -f "$f" ] || continue
+          for f in dist/super_rct-*-c dist/super_rct-*-c.exe \
+                   dist/super_rct-*-nuitka dist/super_rct-*-nuitka.exe; do
             echo "== $f"
             "$f" --version
             found=$((found + 1))
@@ -130,4 +136,4 @@ jobs:
           ls -la artifacts
           gh release create "$TAG" artifacts/* \
             --title "Super_RCT $TAG" \
-            --notes "Executables for Linux, macOS and Windows, built by .github/workflows/build-executables.yml."
+            --notes "One executable per protocol (Telegram, Discord), per language (C, Python) and per OS. Built by .github/workflows/build-executables.yml."

@@ -26,7 +26,9 @@ DEFAULT_NAME = "super_rct"
 NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
 # Python files the bot needs at run time (super_rct.py imports the others).
-PY_FILES = ("super_rct.py", "monitor.py", "commands_table.py", "discord_transport.py")
+PY_FILES = ("super_rct.py", "monitor.py", "commands_table.py", "discord_transport.py",
+            "build_protocol.py")
+PROTOCOLS = ("both", "telegram", "discord")
 
 TARGETS = {
     "c": "C binary: smallest, no Python needed (make release)",
@@ -46,6 +48,7 @@ class Plan:
     name: str
     dry_run: bool = False
     notes: list = field(default_factory=list)
+    protocol: str = "both"  # both, telegram or discord: which chat protocol the file serves
 
 
 @dataclass
@@ -65,11 +68,16 @@ def resolve_out(text):
     return path if path.is_absolute() else ROOT / path
 
 
-def stage_python_sources(dest):
-    """Copies the bot's Python files into `dest` and returns that path."""
+def stage_python_sources(dest, protocol="both"):
+    """Copies the bot's Python files into `dest` and returns that path.
+
+    The copy of build_protocol.py is set to `protocol`, so the executable serves
+    only that chat protocol.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     for name in PY_FILES:
         shutil.copy2(SRC / name, dest / name)
+    (dest / "build_protocol.py").write_text(f'PROTOCOL = "{protocol}"\n', encoding="utf-8")
     return dest
 
 
@@ -105,7 +113,8 @@ def nuitka_steps(plan):
             f"--output-dir={plan.out_dir}", f"--output-filename={plan.name}",
             "super_rct.py"]
     return [
-        Step(f"Copy the bot sources to {stage}", lambda p: stage_python_sources(stage)),
+        Step(f"Copy the bot sources to {stage}",
+             lambda p: stage_python_sources(stage, p.protocol)),
         Step("Compile with Nuitka", (argv, stage)),
     ]
 
@@ -113,7 +122,8 @@ def nuitka_steps(plan):
 def build_steps(plan):
     """Returns the ordered steps for `plan`. Raises BuildError for bad combinations."""
     if plan.target == "c":
-        return [Step("Compile the C bot (make release)", (["make", "release"], ROOT)),
+        return [Step(f"Compile the C bot for the {plan.protocol} protocol (make release)",
+                     (["make", "release", f"PROTOCOL={plan.protocol}"], ROOT)),
                 Step(f"Copy the binary to {plan.out_dir / plan.name}", c_copy_step)]
     if plan.target == "py-nuitka":
         return nuitka_steps(plan)
@@ -255,6 +265,9 @@ def build_parser():
     parser.add_argument("--target", choices=list(TARGETS), help="what to build")
     parser.add_argument("--out", default=DEFAULT_OUT,
                         help=f"output folder, relative to the repository root (default {DEFAULT_OUT})")
+    parser.add_argument("--protocol", choices=list(PROTOCOLS), default="both",
+                        help="chat protocol the file serves: telegram, discord, or both "
+                             "(default both). Release builds use one protocol per file.")
     parser.add_argument("--name", default=DEFAULT_NAME,
                         help=f"output file name (default {DEFAULT_NAME})")
     parser.add_argument("--dry-run", action="store_true",
@@ -290,7 +303,8 @@ def main(argv=None):
                   "arguments for the wizard", file=sys.stderr)
             return 2
         plan = Plan(target=args.target, out_dir=resolve_out(args.out),
-                    name=validate_name(args.name), dry_run=args.dry_run)
+                    name=validate_name(args.name), dry_run=args.dry_run,
+                    protocol=args.protocol)
         return execute(plan)
     except BuildError as err:
         print(f"error: {err}", file=sys.stderr)

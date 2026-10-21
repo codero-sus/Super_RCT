@@ -56,6 +56,24 @@
 
 #include "commands_table.h"
 
+/*
+ * Which chat protocol this executable serves. The build sets it:
+ *   make release PROTOCOL=telegram   Telegram only
+ *   make release PROTOCOL=discord    Discord only
+ *   make release                     both (source default, used by the tests)
+ */
+#define SRCT_PROTO_BOTH 0
+#define SRCT_PROTO_TELEGRAM 1
+#define SRCT_PROTO_DISCORD 2
+#ifndef SRCT_PROTOCOL
+#define SRCT_PROTOCOL SRCT_PROTO_BOTH
+#endif
+#define USE_TELEGRAM (SRCT_PROTOCOL != SRCT_PROTO_DISCORD)
+#define USE_DISCORD (SRCT_PROTOCOL != SRCT_PROTO_TELEGRAM)
+#define SRCT_PROTOCOL_NAME \
+    (SRCT_PROTOCOL == SRCT_PROTO_TELEGRAM ? "telegram" \
+                                          : SRCT_PROTOCOL == SRCT_PROTO_DISCORD ? "discord" : "both")
+
 #define SRCT_VERSION "0.5.0"
 
 #define DEFAULT_API "https://api.telegram.org"
@@ -1281,11 +1299,16 @@ static bool load_config(void) {
     const char *ipf = getenv("SUPER_RCT_IP_FILE");
     const char *sf = getenv("SUPER_RCT_STATE_FILE");
 
-    if (!tok || !valid_token(tok)) {
-        fprintf(stderr, "error: SUPER_RCT_TOKEN is missing or malformed\n");
+    if (USE_TELEGRAM) {
+        if (!tok || !valid_token(tok)) {
+            fprintf(stderr, "error: SUPER_RCT_TOKEN is missing or malformed\n");
+            return false;
+        }
+        strcpy(g_token, tok);
+    } else if (tok && *tok) {
+        fprintf(stderr, "error: SUPER_RCT_TOKEN is not used by the Discord build; remove it\n");
         return false;
     }
-    strcpy(g_token, tok);
 
     {
         const char *sh = getenv("SUPER_RCT_SHELL");
@@ -1318,11 +1341,15 @@ static bool load_config(void) {
         g_session_s = v;
     }
 
-    if (!chats || !*chats) {
+    if (!USE_TELEGRAM && chats && *chats) {
+        fprintf(stderr, "error: SUPER_RCT_CHAT_IDS is not used by the Discord build; remove it\n");
+        return false;
+    }
+    if (USE_TELEGRAM && (!chats || !*chats)) {
         fprintf(stderr, "error: SUPER_RCT_CHAT_IDS is required (comma-separated)\n");
         return false;
     }
-    {
+    if (USE_TELEGRAM) {
         const char *p = chats;
         char *end;
 
@@ -1356,6 +1383,15 @@ static bool load_config(void) {
         const char *dc = getenv("SUPER_RCT_DISCORD_CHANNEL_IDS");
         const char *da = getenv("SUPER_RCT_DISCORD_API");
 
+        if (!USE_DISCORD && ((dt && *dt) || (dc && *dc) || (da && *da))) {
+            fprintf(stderr, "error: SUPER_RCT_DISCORD_* is not used by the Telegram build; "
+                            "remove it\n");
+            return false;
+        }
+        if (SRCT_PROTOCOL == SRCT_PROTO_DISCORD && !(dt && *dt)) {
+            fprintf(stderr, "error: SUPER_RCT_DISCORD_TOKEN is required in the Discord build\n");
+            return false;
+        }
         if (da && *da) {
             if (strlen(da) >= MAX_URL) {
                 fprintf(stderr, "error: SUPER_RCT_DISCORD_API is too long\n");
@@ -1540,26 +1576,30 @@ int main(int argc, char **argv) {
 
     g_started = time(NULL);
     ip_load();
-    logf_("Super_RCT %s started (%d allowed chat(s), %d IP entries)", SRCT_VERSION,
-          g_nchats, g_nips);
+    logf_("Super_RCT %s started (%s build, %d allowed chat(s), %d IP entries)", SRCT_VERSION,
+          SRCT_PROTOCOL_NAME, g_nchats, g_nips);
 
     while (!g_stop) {
         buf_t resp = {0};
 
-        if (tg_get_updates(g_discord_on ? 1 : POLL_TIMEOUT_S, &resp) != 0 || !resp.data) {
-            if (g_stop) {
+        if (!USE_TELEGRAM) {
+            sleep_interruptible(1); /* Discord-only build: no Telegram polling */
+        } else {
+            if (tg_get_updates(g_discord_on ? 1 : POLL_TIMEOUT_S, &resp) != 0 || !resp.data) {
+                if (g_stop) {
+                    buf_free(&resp);
+                    break;
+                }
+                logf_("getUpdates failed; retrying in %d s", RETRY_DELAY_S);
                 buf_free(&resp);
-                break;
+                sleep_interruptible(RETRY_DELAY_S);
+                continue;
             }
-            logf_("getUpdates failed; retrying in %d s", RETRY_DELAY_S);
+            if (!handle_response(resp.data))
+                sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
             buf_free(&resp);
-            sleep_interruptible(RETRY_DELAY_S);
-            continue;
         }
-        if (!handle_response(resp.data))
-            sleep_interruptible(RETRY_DELAY_S); /* back off on API errors */
-        buf_free(&resp);
-        if (g_discord_on && time(NULL) >= g_next_discord_poll) {
+        if (USE_DISCORD && g_discord_on && time(NULL) >= g_next_discord_poll) {
             g_next_discord_poll = time(NULL) + DISCORD_POLL_S;
             for (int i = 0; i < g_nchats; i++)
                 if (g_chats[i].discord)
