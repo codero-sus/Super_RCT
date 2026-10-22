@@ -4,6 +4,19 @@ A Telegram bot that runs on an Android phone and answers commands about the
 device. It is the Java edition of Super_RCT; the same settings and login rules
 as the C and Python editions.
 
+## Build on Windows (with builder.py)
+
+1. Double-click `setup.bat` in the repository root (once). It installs Java 17,
+   the Android SDK (platform 34, build-tools 34.0.0, platform-tools) and Gradle 8.9
+   if they are missing, and creates the Gradle wrapper in `android\`.
+   Open a new terminal afterwards.
+2. `python builder.py` builds the debug APK and copies it to `dist\`.
+3. Turn on USB debugging on the phone, connect it by USB, accept the prompt, then
+   `python builder.py --install` (or copy the APK to the phone yourself).
+
+`python builder.py --check` shows which tools were found. `--test` runs the core
+unit tests first. `--no-build --install` reinstalls the last APK.
+
 ## Get the APK
 
 GitHub Actions builds it: open the **Android edition (Java)** workflow run for
