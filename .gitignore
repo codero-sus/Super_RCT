@@ -4,3 +4,7 @@ super_rct_ips.txt
 __pycache__/
 
 python.env
+
+# Android edition (Gradle)
+.gradle/
+android/local.properties
