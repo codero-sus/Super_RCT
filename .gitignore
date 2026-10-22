@@ -8,3 +8,6 @@ python.env
 # Android edition (Gradle)
 .gradle/
 android/local.properties
+
+# Built APKs copied by builder.py
+dist/
