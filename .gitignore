@@ -9,5 +9,8 @@ python.env
 .gradle/
 android/local.properties
 
-# Built APKs copied by builder.py
+# Bot token, chat IDs and password, compiled into the APK. Never commit these.
+android/app/secrets.properties
+
+# Built APKs copied by builder.py (they contain the secrets)
 dist/
