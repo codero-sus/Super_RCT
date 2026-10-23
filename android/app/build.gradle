@@ -2,6 +2,20 @@ plugins {
     id 'com.android.application'
 }
 
+// Secrets come from app/secrets.properties (git-ignored, written by builder.py).
+// They are compiled into BuildConfig. Missing values stay empty, and the app then
+// logs "not started" instead of running.
+def secrets = new Properties()
+def secretsFile = file('secrets.properties')
+if (secretsFile.exists()) {
+    secretsFile.withInputStream { secrets.load(it) }
+}
+
+// Turns a value into a Java string literal (escapes backslashes and quotes).
+def javaString = { String value ->
+    '"' + (value ?: '').replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
+
 android {
     namespace 'rct.android'
     compileSdk 34
@@ -12,6 +26,15 @@ android {
         targetSdk 34
         versionCode 1
         versionName '0.5.0'
+
+        buildConfigField 'String', 'BOT_TOKEN', javaString(secrets.getProperty('SUPER_RCT_TOKEN', ''))
+        buildConfigField 'String', 'CHAT_IDS', javaString(secrets.getProperty('SUPER_RCT_CHAT_IDS', ''))
+        buildConfigField 'String', 'PASSWORD', javaString(secrets.getProperty('SUPER_RCT_PASSWORD', ''))
+        buildConfigField 'String', 'SESSION_SECONDS', javaString(secrets.getProperty('SUPER_RCT_SESSION_SECONDS', ''))
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     compileOptions {
